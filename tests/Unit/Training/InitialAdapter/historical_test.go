@@ -4,9 +4,12 @@ package initialadapter_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"testing"
 
+	fixture "github.com/tayi-ai/arandu-llama/tests/Unit/Training/Fixture"
 	"github.com/tayi-ai/arandu-llama/training/decoder"
 )
 
@@ -37,5 +40,45 @@ func TestHistoricalInitializerKeepsItsPin(t *testing.T) {
 	defer a.Close()
 	if a.SHA256 != spec.ExpectedSHA256 || len(a.Parameters) != 32 {
 		t.Fatal("historical initializer identity differs", a.SHA256, len(a.Parameters))
+	}
+}
+
+// A description runs the same stream as the pinned initializer: its aggregate
+// is the independent CPU reference's, and its per-tensor digests are the
+// pinned tensors' bytes. It refuses a spec that already carries a pin.
+func TestDescriptionIsThePinnedInitializersIdentity(t *testing.T) {
+	for _, spec := range []decoder.InitialAdapterSpec{smallSpec(t), historicalSpec()} {
+		pinned := spec
+		spec.ExpectedSHA256 = ""
+		aggregate, tensors, err := decoder.DescribeInitialAdapter(context.Background(), spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if aggregate != pinned.ExpectedSHA256 || aggregate != fixture.Digest(t, spec) {
+			t.Fatal("described aggregate differs from the pin and the independent reference", aggregate)
+		}
+		initial, err := decoder.InitializeAdapter(context.Background(), pinned)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tensors) != len(initial.Parameters) {
+			t.Fatal("described tensor count differs")
+		}
+		for i, parameter := range initial.Parameters {
+			content, err := parameter.Value.Bytes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := parameter.Value.Info()
+			if err != nil || tensors[i].Name != parameter.Name || fmt.Sprint(tensors[i].Shape) != fmt.Sprint(info.Shape) || tensors[i].SHA256 != fmt.Sprintf("%x", sha256.Sum256(content)) {
+				t.Fatalf("described tensor %d differs: %+v", i, tensors[i])
+			}
+		}
+		if err := initial.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := decoder.DescribeInitialAdapter(context.Background(), pinned); !errors.Is(err, decoder.ErrInitialAdapterSpec) {
+			t.Fatal("a pinned spec was described", err)
+		}
 	}
 }

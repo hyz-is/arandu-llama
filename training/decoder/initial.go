@@ -70,8 +70,58 @@ func (a *InitialAdapter) Close() error {
 // private generator. Each projection consumes constructor A and B draws, resets
 // A with the inverse-square-root input bound and sets B to exact positive zero.
 // The mandatory aggregate digest rejects an unqualified schedule or backend.
-func InitializeAdapter(ctx context.Context, spec InitialAdapterSpec) (_ *InitialAdapter, err error) {
-	if ctx == nil || spec.PreludeBlocks < 0 || spec.PreludeBlocks > 4096 || len(spec.ExpectedSHA256) != 64 || strings.ToLower(spec.ExpectedSHA256) != spec.ExpectedSHA256 {
+func InitializeAdapter(ctx context.Context, spec InitialAdapterSpec) (*InitialAdapter, error) {
+	if len(spec.ExpectedSHA256) != 64 || strings.ToLower(spec.ExpectedSHA256) != spec.ExpectedSHA256 {
+		return nil, ErrInitialAdapterSpec
+	}
+	return generateInitialAdapter(ctx, spec, true)
+}
+
+// InitialTensorDigest identifies one initializer tensor by name, shape and
+// the SHA-256 of its FP32 bytes.
+type InitialTensorDigest struct {
+	Name   string
+	Shape  []int64
+	SHA256 string
+}
+
+// DescribeInitialAdapter runs the InitializeAdapter schedule for a spec that
+// has no identity yet, and returns the aggregate digest InitializeAdapter
+// would require as ExpectedSHA256 and each tensor's content digest in
+// parameter order. It returns no tensors, so no training can start from an
+// unpinned schedule. ExpectedSHA256 must be empty.
+func DescribeInitialAdapter(ctx context.Context, spec InitialAdapterSpec) (_ string, _ []InitialTensorDigest, err error) {
+	if spec.ExpectedSHA256 != "" {
+		return "", nil, fmt.Errorf("%w: a description has no expected digest", ErrInitialAdapterSpec)
+	}
+	adapter, err := generateInitialAdapter(ctx, spec, false)
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() { err = errors.Join(err, adapter.Close()) }()
+	tensors := make([]InitialTensorDigest, 0, len(adapter.Parameters))
+	for _, parameter := range adapter.Parameters {
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
+		info, err := parameter.Value.Info()
+		if err != nil {
+			return "", nil, err
+		}
+		content, err := parameter.Value.Bytes()
+		if err != nil {
+			return "", nil, err
+		}
+		digest := sha256.Sum256(content)
+		tensors = append(tensors, InitialTensorDigest{Name: parameter.Name, Shape: info.Shape, SHA256: hex.EncodeToString(digest[:])})
+	}
+	return adapter.SHA256, tensors, nil
+}
+
+// generateInitialAdapter runs the schedule. A pinned run requires the
+// aggregate to equal spec.ExpectedSHA256; an unpinned one only reports it.
+func generateInitialAdapter(ctx context.Context, spec InitialAdapterSpec, pinned bool) (_ *InitialAdapter, err error) {
+	if ctx == nil || spec.PreludeBlocks < 0 || spec.PreludeBlocks > 4096 {
 		return nil, ErrInitialAdapterSpec
 	}
 	if len(spec.Projections) == 0 || len(spec.Projections) > 8192 || spec.PreludeWidth < 0 || spec.PreludeWidth > 1<<20 || spec.PreludeBlocks > 0 && (spec.PreludeWidth == 0 || math.IsNaN(spec.PreludeLow) || math.IsNaN(spec.PreludeHigh) || math.IsInf(spec.PreludeLow, 0) || math.IsInf(spec.PreludeHigh, 0) || spec.PreludeLow >= spec.PreludeHigh) {
@@ -89,9 +139,11 @@ func InitializeAdapter(ctx context.Context, spec InitialAdapterSpec) (_ *Initial
 	if expectedElements > 1<<30 {
 		return nil, ErrInitialAdapterSpec
 	}
-	expected, err := hex.DecodeString(spec.ExpectedSHA256)
-	if err != nil {
-		return nil, fmt.Errorf("%w: malformed digest", ErrInitialAdapterSpec)
+	var expected []byte
+	if pinned {
+		if expected, err = hex.DecodeString(spec.ExpectedSHA256); err != nil {
+			return nil, fmt.Errorf("%w: malformed digest", ErrInitialAdapterSpec)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -196,7 +248,7 @@ func InitializeAdapter(ctx context.Context, spec InitialAdapterSpec) (_ *Initial
 		return nil, errors.New("decoder: initial adapter geometry differs")
 	}
 	observed := digest.Sum(nil)
-	if !bytes.Equal(observed, expected) {
+	if pinned && !bytes.Equal(observed, expected) {
 		return nil, ErrInitialAdapterIdentity
 	}
 	result.SHA256 = hex.EncodeToString(observed)
