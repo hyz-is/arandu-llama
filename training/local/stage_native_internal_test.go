@@ -219,7 +219,7 @@ func sftFixture(t *testing.T) (StageConfig, pipeline.StageContext, []example) {
 		Limits: StageLimits{MaxProtocolBytes: 1 << 20, MaxDataBytes: 1 << 16, MaxMetadataBytes: 1 << 16, MaxManifestBytes: 1 << 16, MaxTensorFileBytes: 1 << 20, MaxTotalBytes: 10 << 20, MaxDataTokens: 256, MaxParameters: 100, WorkingBytes: 8 << 20, MaxSteps: 3, Checkpoint: checkpoint.Limits{MaxHeaderBytes: 4096, MaxTensors: 16, MaxDimensions: 2, MaxMetadataEntries: 1, MaxChunkBytes: 64}}}
 	c := StageConfig{Recipe: r, Placement: placement, Protocol: protocol, BundleDirectory: source, ModelDirectory: source, DataDirectory: source, InitialDirectory: source}
 	sftPin(t, &c)
-	ctx := pipeline.StageContext{Execution: pipeline.Execution{RunID: "run", TenantID: "tenant", Generation: 1, Recipe: r, TargetSHA256: r.Student.SHA256, Placement: placement}, Stage: r.Stages[0], ArtifactDirectory: artifacts}
+	ctx := pipeline.StageContext{Execution: pipeline.Execution{RunID: "run", TenantID: "tenant", Generation: 1, Recipe: r, TargetSHA256: ref("execution-target").SHA256, Placement: placement}, Stage: r.Stages[0], ArtifactDirectory: artifacts}
 	return c, ctx, rows
 }
 func sftExecutor(t *testing.T, calls *int, closed *int) stageDelivery {

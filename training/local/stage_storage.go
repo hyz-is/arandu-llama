@@ -374,7 +374,13 @@ func (h *Stage) identity(ctx context.Context, c pipeline.StageContext) (pipeline
 	if err := h.Admit(ctx, x.Recipe, c.Stage, x.Placement); err != nil {
 		return pipeline.ReceiptIdentity{}, err
 	}
-	if !stageID(x.RunID) || !stageID(x.TenantID) || x.Generation == 0 || x.TargetSHA256 != h.config.Recipe.Student.SHA256 || c.Parent != nil {
+	// TargetSHA256 names the application's execution target, and the rest of
+	// the pipeline treats it as an opaque digest carried into the receipt. It
+	// was compared here with the student's digest, which no application sets:
+	// the student is already bound by the recipe digest and by the protocol's
+	// WeightsSHA256, both checked in Admit above, so the comparison only
+	// refused every real submission while fixtures that set both alike passed.
+	if !stageID(x.RunID) || !stageID(x.TenantID) || x.Generation == 0 || !validHash(x.TargetSHA256) || c.Parent != nil {
 		return pipeline.ReceiptIdentity{}, ErrStage
 	}
 	return pipeline.ReceiptIdentity{RunID: x.RunID, TenantID: x.TenantID, RecipeSHA256: h.config.Protocol.RecipeSHA256, TargetSHA256: x.TargetSHA256, PlacementSHA256: h.config.Protocol.PlacementSHA256, Generation: x.Generation}, nil

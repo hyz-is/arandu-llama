@@ -283,3 +283,26 @@ func TestNativeSFTStageFreshStartIsExplicitAndRefusesHalfDeclaredStarts(t *testi
 		t.Fatal("a fresh start does not stand before the first example", next, prior.Step, e)
 	}
 }
+
+// The execution target is the application's, not the student: the receipt
+// carries whatever digest the application names, and the student stays bound
+// through the recipe. A target equal to the student was the only shape the
+// stage accepted before, and no application submits it.
+func TestNativeSFTStageCarriesTheApplicationsTargetDigest(t *testing.T) {
+	c, stage, _, _ := sftFreshFixture(t)
+	h, e := newStage(c, func(context.Context, Config, *stepHooks) error { return nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	if stage.Execution.TargetSHA256 == c.Recipe.Student.SHA256 {
+		t.Fatal("fixture no longer distinguishes the execution target from the student")
+	}
+	identity, e := h.identity(context.Background(), stage)
+	if e != nil || identity.TargetSHA256 != stage.Execution.TargetSHA256 {
+		t.Fatal("the application's target digest was refused or replaced", identity.TargetSHA256, e)
+	}
+	stage.Execution.TargetSHA256 = "not-a-digest"
+	if _, e := h.identity(context.Background(), stage); e == nil {
+		t.Fatal("a malformed target digest was admitted")
+	}
+}
