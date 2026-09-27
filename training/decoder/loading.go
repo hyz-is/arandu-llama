@@ -52,6 +52,9 @@ type AssemblyLimits struct {
 	MaxScoreElements              int64
 	MaxWorkingElements            int64
 	Sequence                      sequence.SequenceLimits
+	// AdapterCoverage declares the adapted projections. Nil is the q/v
+	// coverage of full attention and leaves this field out of the encoding.
+	AdapterCoverage *AdapterCoverage `json:",omitempty"`
 }
 
 // AssemblyTensor specifies a checkpoint weight and its required final identity.
@@ -219,6 +222,7 @@ func PlanTextAssembly(indexJSON, configJSON, referenceJSON []byte, identity Asse
 	}
 	limits.PersistentBytes = slices.Clone(limits.PersistentBytes)
 	limits.DeviceByLayer = slices.Clone(limits.DeviceByLayer)
+	limits.AdapterCoverage = limits.AdapterCoverage.clone()
 	p := &AssemblyPlan{limits: limits, geometry: geometry, summary: AssemblySummary{Identity: identity, PersistentBytes: make([]int64, len(limits.PersistentBytes))}}
 	p.weights, p.adapters = assemblyGeometry(geometry, limits)
 	admittedNames := make(map[string]bool, len(p.weights)+len(p.adapters))
@@ -452,9 +456,10 @@ type assemblyReference struct {
 }
 
 func assemblyGeometry(c TextGeometry, limits AssemblyLimits) (weights, adapters []AssemblyTensor) {
-	add := func(source string, shape []int64, dtype torch.DType, device int) {
+	// A covered projection keeps its weight under PEFT's base_layer name.
+	add := func(source string, shape []int64, dtype torch.DType, device int, adapted bool) {
 		ref := "base_model.model." + source
-		if strings.Contains(source, ".self_attn.q_proj.") || strings.Contains(source, ".self_attn.v_proj.") {
+		if adapted {
 			ref = strings.TrimSuffix(ref, ".weight") + ".base_layer.weight"
 		}
 		count := int64(1)
@@ -467,56 +472,60 @@ func assemblyGeometry(c TextGeometry, limits AssemblyLimits) (weights, adapters 
 		}
 		weights = append(weights, AssemblyTensor{SourceName: source, ReferenceName: ref, Shape: shape, DType: dtype, Device: torch.CUDADevice(device), Bytes: count * width})
 	}
-	add("model.language_model.embed_tokens.weight", []int64{c.Vocab, c.Hidden}, torch.Float16, limits.EmbeddingDevice)
+	type item struct {
+		suffix string
+		shape  []int64
+	}
+	add("model.language_model.embed_tokens.weight", []int64{c.Vocab, c.Hidden}, torch.Float16, limits.EmbeddingDevice, false)
 	for layer := 0; layer < c.Layers; layer++ {
 		device := limits.DeviceByLayer[layer]
 		prefix := fmt.Sprintf("model.language_model.layers.%d.", layer)
-		if c.LayerTypes[layer] == "full_attention" {
-			for _, item := range []struct {
-				suffix string
-				shape  []int64
-			}{
-				{"q_proj.weight", []int64{2 * c.Heads * c.Dimension, c.Hidden}}, {"k_proj.weight", []int64{c.KVHeads * c.Dimension, c.Hidden}},
-				{"v_proj.weight", []int64{c.KVHeads * c.Dimension, c.Hidden}}, {"o_proj.weight", []int64{c.Hidden, c.Heads * c.Dimension}},
-				{"q_norm.weight", []int64{c.Dimension}}, {"k_norm.weight", []int64{c.Dimension}},
-			} {
-				add(prefix+"self_attn."+item.suffix, item.shape, torch.Float32, device)
-			}
-			for _, item := range []struct {
-				projection, letter string
-				shape              []int64
-			}{
-				{"q_proj", "A", []int64{limits.AdapterRank, c.Hidden}}, {"q_proj", "B", []int64{2 * c.Heads * c.Dimension, limits.AdapterRank}},
-				{"v_proj", "A", []int64{limits.AdapterRank, c.Hidden}}, {"v_proj", "B", []int64{c.KVHeads * c.Dimension, limits.AdapterRank}},
-			} {
-				name := "base_model.model." + prefix + "self_attn." + item.projection + ".lora_" + item.letter + ".default.weight"
-				adapters = append(adapters, AssemblyTensor{ReferenceName: name, Shape: item.shape, DType: torch.Float32, Device: torch.CUDADevice(device), Bytes: item.shape[0] * item.shape[1] * 4, Trainable: true})
-			}
-		} else {
-			for _, item := range []struct {
-				suffix string
-				shape  []int64
-			}{
-				{"dt_bias", []int64{c.VHeads}}, {"A_log", []int64{c.VHeads}}, {"conv1d.weight", []int64{2*c.KHeads*c.KDimension + c.VHeads*c.VDimension, 1, c.Conv}},
-				{"norm.weight", []int64{c.VDimension}}, {"out_proj.weight", []int64{c.Hidden, c.VHeads * c.VDimension}},
-				{"in_proj_qkv.weight", []int64{2*c.KHeads*c.KDimension + c.VHeads*c.VDimension, c.Hidden}}, {"in_proj_z.weight", []int64{c.VHeads * c.VDimension, c.Hidden}},
-				{"in_proj_b.weight", []int64{c.VHeads, c.Hidden}}, {"in_proj_a.weight", []int64{c.VHeads, c.Hidden}},
-			} {
-				add(prefix+"linear_attn."+item.suffix, item.shape, torch.Float32, device)
+		targets := limits.AdapterCoverage.targets(c.LayerTypes[layer])
+		adapted := make(map[string]bool, len(targets))
+		for _, target := range targets {
+			adapted[adapterModules[target]] = true
+		}
+		shapes := make(map[string][]int64)
+		addLayer := func(items []item, dtype torch.DType) {
+			for _, item := range items {
+				module := strings.TrimSuffix(item.suffix, ".weight")
+				shapes[module] = item.shape
+				add(prefix+item.suffix, item.shape, dtype, device, adapted[module])
 			}
 		}
-		for _, item := range []struct {
-			suffix string
-			shape  []int64
-		}{
+		if c.LayerTypes[layer] == "full_attention" {
+			addLayer([]item{
+				{"self_attn.q_proj.weight", []int64{2 * c.Heads * c.Dimension, c.Hidden}}, {"self_attn.k_proj.weight", []int64{c.KVHeads * c.Dimension, c.Hidden}},
+				{"self_attn.v_proj.weight", []int64{c.KVHeads * c.Dimension, c.Hidden}}, {"self_attn.o_proj.weight", []int64{c.Hidden, c.Heads * c.Dimension}},
+				{"self_attn.q_norm.weight", []int64{c.Dimension}}, {"self_attn.k_norm.weight", []int64{c.Dimension}},
+			}, torch.Float32)
+		} else {
+			addLayer([]item{
+				{"linear_attn.dt_bias", []int64{c.VHeads}}, {"linear_attn.A_log", []int64{c.VHeads}}, {"linear_attn.conv1d.weight", []int64{2*c.KHeads*c.KDimension + c.VHeads*c.VDimension, 1, c.Conv}},
+				{"linear_attn.norm.weight", []int64{c.VDimension}}, {"linear_attn.out_proj.weight", []int64{c.Hidden, c.VHeads * c.VDimension}},
+				{"linear_attn.in_proj_qkv.weight", []int64{2*c.KHeads*c.KDimension + c.VHeads*c.VDimension, c.Hidden}}, {"linear_attn.in_proj_z.weight", []int64{c.VHeads * c.VDimension, c.Hidden}},
+				{"linear_attn.in_proj_b.weight", []int64{c.VHeads, c.Hidden}}, {"linear_attn.in_proj_a.weight", []int64{c.VHeads, c.Hidden}},
+			}, torch.Float32)
+		}
+		addLayer([]item{
 			{"mlp.gate_proj.weight", []int64{c.MLP, c.Hidden}}, {"mlp.up_proj.weight", []int64{c.MLP, c.Hidden}}, {"mlp.down_proj.weight", []int64{c.Hidden, c.MLP}},
 			{"input_layernorm.weight", []int64{c.Hidden}}, {"post_attention_layernorm.weight", []int64{c.Hidden}},
-		} {
-			add(prefix+item.suffix, item.shape, torch.Float16, device)
+		}, torch.Float16)
+		// A is [rank,input] and B is [output,rank] of the covered base weight.
+		for _, target := range targets {
+			module := adapterModules[target]
+			base := shapes[module]
+			for _, pair := range []struct {
+				letter string
+				shape  []int64
+			}{{"A", []int64{limits.AdapterRank, base[1]}}, {"B", []int64{base[0], limits.AdapterRank}}} {
+				name := "base_model.model." + prefix + module + ".lora_" + pair.letter + ".default.weight"
+				adapters = append(adapters, AssemblyTensor{ReferenceName: name, Shape: pair.shape, DType: torch.Float32, Device: torch.CUDADevice(device), Bytes: pair.shape[0] * pair.shape[1] * 4, Trainable: true})
+			}
 		}
 	}
-	add("model.language_model.norm.weight", []int64{c.Hidden}, torch.Float16, limits.OutputDevice)
-	add("lm_head.weight", []int64{c.Vocab, c.Hidden}, torch.Float16, limits.OutputDevice)
+	add("model.language_model.norm.weight", []int64{c.Hidden}, torch.Float16, limits.OutputDevice, false)
+	add("lm_head.weight", []int64{c.Vocab, c.Hidden}, torch.Float16, limits.OutputDevice, false)
 	return
 }
 
@@ -538,7 +547,7 @@ func validateAssemblyLimits(limits AssemblyLimits) error {
 		limits.Sequence.MaxTokens <= 0 || limits.Sequence.MaxOwnedElements <= 0 {
 		return fmt.Errorf("%w: explicit positive parsing, copy, persistent and execution limits required", ErrAssembly)
 	}
-	return nil
+	return limits.AdapterCoverage.Validate()
 }
 
 func assemblyContext(ctx context.Context, plan *AssemblyPlan, provider ShardProvider) error {
@@ -727,12 +736,31 @@ func wireAssembly(model *TextModel, values map[string]*torch.Tensor, c TextGeome
 		layer.Config = layers.DecoderConfig{Epsilon: c.Epsilon, MaxInputElements: limits.MaxInputElements,
 			Full:   layers.AttentionConfig{Heads: c.Heads, KVHeads: c.KVHeads, HeadDimension: c.Dimension, RotaryDimension: int64(float64(c.Dimension) * c.RoPE.Partial), Epsilon: c.Epsilon, MaxScoreElements: limits.MaxScoreElements},
 			Linear: layers.LinearAttentionConfig{KeyHeads: c.KHeads, ValueHeads: c.VHeads, KeyDimension: c.KDimension, ValueDimension: c.VDimension, Epsilon: c.Epsilon, MaxWorkingElements: limits.MaxWorkingElements, Sequence: limits.Sequence, FrozenWeightsValidated: true}}
-		layer.Weights = layers.DecoderWeights{InputNorm: g("input_layernorm.weight"), PostAttentionNorm: g("post_attention_layernorm.weight"), Gate: g("mlp.gate_proj.weight"), Up: g("mlp.up_proj.weight"), Down: g("mlp.down_proj.weight")}
+		targets := limits.AdapterCoverage.targets(c.LayerTypes[i])
+		adapted := make(map[string]bool, len(targets))
+		for _, target := range targets {
+			adapted[adapterModules[target]] = true
+		}
+		// base returns a projection under the name its coverage gave it.
+		base := func(module string) *torch.Tensor {
+			if adapted[module] {
+				return g(module + ".base_layer.weight")
+			}
+			return g(module + ".weight")
+		}
+		layer.Weights = layers.DecoderWeights{InputNorm: g("input_layernorm.weight"), PostAttentionNorm: g("post_attention_layernorm.weight"), Gate: base("mlp.gate_proj"), Up: base("mlp.up_proj"), Down: base("mlp.down_proj")}
 		if c.LayerTypes[i] == "full_attention" {
-			layer.Weights.Full = &layers.AttentionWeights{Query: g("self_attn.q_proj.base_layer.weight"), Key: g("self_attn.k_proj.weight"), Value: g("self_attn.v_proj.base_layer.weight"), Output: g("self_attn.o_proj.weight"), QueryNorm: g("self_attn.q_norm.weight"), KeyNorm: g("self_attn.k_norm.weight")}
-			layer.Adapter = &layers.AttentionLoRA{QueryA: g("self_attn.q_proj.lora_A.default.weight"), QueryB: g("self_attn.q_proj.lora_B.default.weight"), ValueA: g("self_attn.v_proj.lora_A.default.weight"), ValueB: g("self_attn.v_proj.lora_B.default.weight"), Alpha: limits.AdapterAlpha}
+			layer.Weights.Full = &layers.AttentionWeights{Query: base("self_attn.q_proj"), Key: base("self_attn.k_proj"), Value: base("self_attn.v_proj"), Output: base("self_attn.o_proj"), QueryNorm: g("self_attn.q_norm.weight"), KeyNorm: g("self_attn.k_norm.weight")}
 		} else {
-			layer.Weights.Linear = &layers.LinearAttentionWeights{QKV: g("linear_attn.in_proj_qkv.weight"), Z: g("linear_attn.in_proj_z.weight"), Beta: g("linear_attn.in_proj_b.weight"), Alpha: g("linear_attn.in_proj_a.weight"), Convolution: g("linear_attn.conv1d.weight"), ALog: g("linear_attn.A_log"), DTBias: g("linear_attn.dt_bias"), Norm: g("linear_attn.norm.weight"), Output: g("linear_attn.out_proj.weight")}
+			layer.Weights.Linear = &layers.LinearAttentionWeights{QKV: base("linear_attn.in_proj_qkv"), Z: base("linear_attn.in_proj_z"), Beta: base("linear_attn.in_proj_b"), Alpha: base("linear_attn.in_proj_a"), Convolution: g("linear_attn.conv1d.weight"), ALog: g("linear_attn.A_log"), DTBias: g("linear_attn.dt_bias"), Norm: g("linear_attn.norm.weight"), Output: base("linear_attn.out_proj")}
+		}
+		if len(targets) != 0 {
+			adapter := &layers.AttentionLoRA{Alpha: limits.AdapterAlpha}
+			for _, target := range targets {
+				a, b := adapter.Pair(target)
+				*a, *b = g(adapterModules[target]+".lora_A.default.weight"), g(adapterModules[target]+".lora_B.default.weight")
+			}
+			layer.Adapter = adapter
 		}
 	}
 }
