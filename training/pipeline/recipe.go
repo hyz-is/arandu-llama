@@ -51,6 +51,7 @@ type Recipe struct {
 	Version int `json:"schema_version"`
 	// Scope is empty for v1's full method. V2 requires "master" and ends only
 	// after the six complete phases through Master evaluation, before variants.
+	// V3 requires "sft": one causal SFT stage, student and training data only.
 	Scope    string        `json:"scope,omitempty"`
 	ID       string        `json:"id"`
 	Method   string        `json:"method"`
@@ -70,7 +71,11 @@ type Recipe struct {
 // Validate refuses incomplete declared deliveries, reordering and mixed roles.
 // V1 requires Master and all variants. V2 Master scope does not certify any
 // calibration or quantized variant, and cannot reuse a v1 recipe identity.
+// V3 SFT scope is preparatory and certifies nothing beyond its own stage.
 func (r Recipe) Validate() error {
+	if r.Version == 3 {
+		return r.validateSFT()
+	}
 	master := r.Version == 2 && r.Scope == "master"
 	full := r.Version == 1 && r.Scope == ""
 	if (!master && !full) || !identifier(r.ID) || r.Method != "generational-fusion-v1" || len(r.Teachers) < 1 || len(r.Teachers) > 8 || (full && len(r.Stages) != 13) || (master && len(r.Stages) != 6) {
@@ -105,7 +110,7 @@ func (r Recipe) Validate() error {
 	seenStages := map[string]bool{}
 	formats := map[string]bool{}
 	for i, stage := range r.Stages {
-		if !identifier(stage.ID) || seenStages[stage.ID] || stage.MaxSteps < 1 || stage.MaxSteps > 1_000_000 || stage.MaxTokens < 2 || stage.MaxTokens > 1_048_576 || stage.TimeoutSeconds < 1 || stage.TimeoutSeconds > 86400 || len(stage.Inputs) == 0 || len(stage.Inputs) > 64 {
+		if !stageBudget(stage) || seenStages[stage.ID] {
 			return errors.New("training recipe: stage identity or budget invalid")
 		}
 		seenStages[stage.ID] = true
@@ -172,10 +177,58 @@ func (r Recipe) Validate() error {
 	return nil
 }
 
+// validateSFT admits the preparatory delivery that trains the student on its
+// own training data and nothing else. It is a separate schema rather than a
+// shortened v2 because a Master scope that could stop after SFT would let a
+// partial run be read as a Master: here the absence of teachers, heldout,
+// recovery, protection and calibration is required, not merely tolerated, so
+// the recipe itself says what the result is not.
+func (r Recipe) validateSFT() error {
+	if r.Scope != "sft" || !identifier(r.ID) || r.Method != "causal-sft-v1" || len(r.Teachers) != 0 || len(r.Stages) != 1 ||
+		r.Recovery != (ArtifactRef{}) || r.Calibration != (ArtifactRef{}) || r.Protection != (ArtifactRef{}) || r.Heldout != (ArtifactRef{}) {
+		return errors.New("training recipe: invalid sft scope, method or roles")
+	}
+	registered := map[string]string{}
+	for _, ref := range []ArtifactRef{r.Student, r.Training} {
+		if !identifier(ref.ID) || !digest(ref.SHA256) || registered[ref.ID] != "" {
+			return errors.New("training recipe: invalid or repeated artifact identity")
+		}
+		registered[ref.ID] = ref.SHA256
+	}
+	stage := r.Stages[0]
+	if !stageBudget(stage) {
+		return errors.New("training recipe: stage identity or budget invalid")
+	}
+	if stage.Phase != PhaseSFT || stage.Format != "" || stage.ParentStage != "" {
+		return errors.New("training recipe: sft scope admits exactly one causal SFT stage")
+	}
+	inputs := map[string]bool{}
+	for _, ref := range stage.Inputs {
+		if !identifier(ref.ID) || !digest(ref.SHA256) || inputs[ref.ID] || registered[ref.ID] != ref.SHA256 {
+			return errors.New("training recipe: stage input identity invalid or unregistered")
+		}
+		inputs[ref.ID] = true
+	}
+	if !inputs[r.Training.ID] {
+		return errors.New("training recipe: stage data role missing")
+	}
+	return nil
+}
+
+func stageBudget(s Stage) bool {
+	return identifier(s.ID) && s.MaxSteps >= 1 && s.MaxSteps <= 1_000_000 && s.MaxTokens >= 2 && s.MaxTokens <= 1_048_576 &&
+		s.TimeoutSeconds >= 1 && s.TimeoutSeconds <= 86400 && len(s.Inputs) > 0 && len(s.Inputs) <= 64
+}
+
 // Digest hashes the canonical typed protocol after validation.
 func (r Recipe) Digest() (string, error) {
 	if err := r.Validate(); err != nil {
 		return "", err
+	}
+	if r.Version == 3 {
+		// V3 has no teachers, and "absent" and "empty" must name one recipe.
+		// Only v3 is normalised: v1 and v2 digests are frozen as written.
+		r.Teachers = nil
 	}
 	body, err := json.Marshal(r)
 	if err != nil {
