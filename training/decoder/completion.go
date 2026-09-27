@@ -69,22 +69,11 @@ func CompletionGradient(ctx context.Context, model *TextModel, tokenIDs []int64,
 		}
 	}()
 
-	info, err := snapshot.Logits.Info()
+	info, values, err := completionLogits(snapshot, completionTokens)
 	if err != nil {
 		return result, err
-	}
-	if len(info.Shape) != 3 || info.Shape[0] != 1 || info.Shape[1] != int64(completionTokens+1) ||
-		info.Shape[2] <= 1 || info.DType != torch.Float32 {
-		return result, fmt.Errorf("%w: completion logits geometry differs", ErrCompletionStep)
 	}
 	vocabulary := int(info.Shape[2])
-	values, err := snapshot.Logits.Float32Values()
-	if err != nil {
-		return result, err
-	}
-	if len(values) != (completionTokens+1)*vocabulary {
-		return result, fmt.Errorf("%w: completion logit payload differs", ErrCompletionStep)
-	}
 	result.Loss, err = completionCotangent(values, vocabulary, tokenIDs[promptTokens:], lossScale)
 	if err != nil {
 		return result, err
@@ -132,10 +121,101 @@ func CompletionGradient(ctx context.Context, model *TextModel, tokenIDs []int64,
 	return result, ctx.Err()
 }
 
+// CompletionLoss reports the Loss CompletionGradient would report for the same
+// model, tokens and limits, without building a cotangent or running VJP. The
+// geometry, the admitted logits and the accumulation order are the gradient's,
+// so the two readings are bitwise equal; the logits are read and never written.
+// Model parameters are not changed. Adapters are optional here: the loss of a
+// model is defined whether or not it can be trained.
+func CompletionLoss(ctx context.Context, model *TextModel, tokenIDs []int64, promptTokens int, limits Limits) (loss float64, err error) {
+	if ctx == nil || model == nil || len(tokenIDs) < 2 || promptTokens < 1 || promptTokens >= len(tokenIDs) {
+		return 0, fmt.Errorf("%w: prompt and completion geometry is invalid", ErrCompletionStep)
+	}
+	completionTokens := len(tokenIDs) - promptTokens
+	if limits.LogitRows != int64(completionTokens+1) {
+		return 0, fmt.Errorf("%w: logit rows must equal supervised tokens plus one", ErrCompletionStep)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	snapshot, err := model.Forward(ctx, tokenIDs, limits)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		err = errors.Join(err, snapshot.Close())
+		if err != nil {
+			loss = 0
+		}
+	}()
+	info, values, err := completionLogits(snapshot, completionTokens)
+	if err != nil {
+		return 0, err
+	}
+	loss, err = completionNLL(values, int(info.Shape[2]), tokenIDs[promptTokens:], nil)
+	if err != nil {
+		return 0, err
+	}
+	return loss, ctx.Err()
+}
+
+// completionLogits admits the one logits layout both readings accept and
+// returns a Go-owned FP32 copy of it.
+func completionLogits(snapshot *Snapshot, completionTokens int) (torch.Info, []float32, error) {
+	info, err := snapshot.Logits.Info()
+	if err != nil {
+		return info, nil, err
+	}
+	if len(info.Shape) != 3 || info.Shape[0] != 1 || info.Shape[1] != int64(completionTokens+1) ||
+		info.Shape[2] <= 1 || info.DType != torch.Float32 {
+		return info, nil, fmt.Errorf("%w: completion logits geometry differs", ErrCompletionStep)
+	}
+	values, err := snapshot.Logits.Float32Values()
+	if err != nil {
+		return info, nil, err
+	}
+	if len(values) != (completionTokens+1)*int(info.Shape[2]) {
+		return info, nil, fmt.Errorf("%w: completion logit payload differs", ErrCompletionStep)
+	}
+	return info, values, nil
+}
+
 func completionCotangent(logits []float32, vocabulary int, targets []int64, lossScale float64) (float64, error) {
 	if vocabulary < 2 || len(targets) == 0 || len(logits) != (len(targets)+1)*vocabulary ||
 		math.IsNaN(lossScale) || math.IsInf(lossScale, 0) || lossScale <= 0 {
 		return 0, fmt.Errorf("%w: invalid completion cotangent geometry", ErrCompletionStep)
+	}
+	factor := lossScale / float64(len(targets))
+	loss, err := completionNLL(logits, vocabulary, targets, func(offset, target int, maximum, sum float64) error {
+		for column := 0; column < vocabulary; column++ {
+			probability := math.Exp(float64(logits[offset+column])-maximum) / sum
+			gradient := probability * factor
+			if column == target {
+				gradient -= factor
+			}
+			rounded := float32(gradient)
+			if math.IsNaN(gradient) || math.IsInf(gradient, 0) ||
+				math.IsNaN(float64(rounded)) || math.IsInf(float64(rounded), 0) {
+				return fmt.Errorf("%w: completion derivative is not finite FP32", ErrCompletionStep)
+			}
+			logits[offset+column] = rounded
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	clear(logits[len(targets)*vocabulary:])
+	return loss, nil
+}
+
+// completionNLL is the one loss both the gradient and the readout report. It
+// only reads logits; scored, when set, runs after each row's loss term is
+// accumulated and before the next row is read, so it may overwrite that row.
+// Keeping one accumulation order keeps the two losses bitwise equal.
+func completionNLL(logits []float32, vocabulary int, targets []int64, scored func(offset, target int, maximum, sum float64) error) (float64, error) {
+	if vocabulary < 2 || len(targets) == 0 || len(logits) != (len(targets)+1)*vocabulary {
+		return 0, fmt.Errorf("%w: invalid completion loss geometry", ErrCompletionStep)
 	}
 	for _, target := range targets {
 		if target < 0 || target >= int64(vocabulary) {
@@ -148,7 +228,6 @@ func completionCotangent(logits []float32, vocabulary int, targets []int64, loss
 		}
 	}
 
-	factor := lossScale / float64(len(targets))
 	totalLoss := 0.0
 	for row, target := range targets {
 		offset := row * vocabulary
@@ -166,21 +245,12 @@ func completionCotangent(logits []float32, vocabulary int, targets []int64, loss
 		logSum := math.Log(sum)
 		targetLogit := float64(logits[offset+int(target)])
 		totalLoss += maximum + logSum - targetLogit
-		for column := 0; column < vocabulary; column++ {
-			probability := math.Exp(float64(logits[offset+column])-maximum) / sum
-			gradient := probability * factor
-			if column == int(target) {
-				gradient -= factor
+		if scored != nil {
+			if err := scored(offset, int(target), maximum, sum); err != nil {
+				return 0, err
 			}
-			rounded := float32(gradient)
-			if math.IsNaN(gradient) || math.IsInf(gradient, 0) ||
-				math.IsNaN(float64(rounded)) || math.IsInf(float64(rounded), 0) {
-				return 0, fmt.Errorf("%w: completion derivative is not finite FP32", ErrCompletionStep)
-			}
-			logits[offset+column] = rounded
 		}
 	}
-	clear(logits[len(targets)*vocabulary:])
 	loss := totalLoss / float64(len(targets))
 	if math.IsNaN(loss) || math.IsInf(loss, 0) {
 		return 0, fmt.Errorf("%w: nonfinite completion loss", ErrCompletionStep)

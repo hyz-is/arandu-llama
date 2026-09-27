@@ -175,3 +175,178 @@ func TestCompletionGradientRejectsInvalidMaskScaleAndCancellation(t *testing.T) 
 		t.Fatalf("canceled completion result=%+v err=%v", result, err)
 	}
 }
+
+// preSplitCotangent is the seed CompletionGradient built before its loss moved
+// into the readout it now shares, kept verbatim. Its bits are pinned by the
+// decoder package's own seed test; here it ties CompletionGradient to its VJP.
+func preSplitCotangent(logits []float32, vocabulary int, targets []int64, lossScale float64) float64 {
+	factor := lossScale / float64(len(targets))
+	totalLoss := 0.0
+	for row, target := range targets {
+		offset := row * vocabulary
+		maximum := float64(logits[offset])
+		for column := 1; column < vocabulary; column++ {
+			maximum = math.Max(maximum, float64(logits[offset+column]))
+		}
+		sum := 0.0
+		for column := 0; column < vocabulary; column++ {
+			sum += math.Exp(float64(logits[offset+column]) - maximum)
+		}
+		logSum := math.Log(sum)
+		targetLogit := float64(logits[offset+int(target)])
+		totalLoss += maximum + logSum - targetLogit
+		for column := 0; column < vocabulary; column++ {
+			probability := math.Exp(float64(logits[offset+column])-maximum) / sum
+			gradient := probability * factor
+			if column == int(target) {
+				gradient -= factor
+			}
+			logits[offset+column] = float32(gradient)
+		}
+	}
+	clear(logits[len(targets)*vocabulary:])
+	return totalLoss / float64(len(targets))
+}
+
+func adapterValues(t *testing.T, f *fixture) [][]float32 {
+	t.Helper()
+	var out [][]float32
+	for _, layer := range f.model.Layers {
+		if layer.Adapter == nil {
+			continue
+		}
+		for index := 0; index < 4; index++ {
+			out = append(out, read(t, *parameter(layer.Adapter, index)))
+		}
+	}
+	return out
+}
+
+// VJP on this fixture is not bitwise reproducible run to run on CPU: on the
+// code before the split, 3 of 60 repeats moved layer 3's adapter gradients by
+// a few float32 ULPs, with OMP_NUM_THREADS=1 as well. The loss comes from the
+// forward alone and is held bitwise; the gradients use the scaled tolerance.
+func TestCompletionGradientIsTheVJPOfThePreSplitCotangent(t *testing.T) {
+	f := newFixture(t, torch.Float32)
+	ctx := context.Background()
+	limits := f.limits
+	limits.LogitRows = 3
+	for _, scale := range []float64{1, 3} {
+		result, err := decoder.CompletionGradient(ctx, f.model, f.tokens, 1, limits, scale)
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := f.model.Forward(ctx, f.tokens, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := snapshot.Logits.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		values := read(t, snapshot.Logits)
+		loss := preSplitCotangent(values, int(info.Shape[2]), f.tokens[1:], scale)
+		gradients, err := f.model.VJP(ctx, snapshot, tensor(t, values, info.Shape, false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if math.Float64bits(result.Loss) != math.Float64bits(loss) {
+			t.Fatalf("scale %g loss %.17g != pre-split %.17g", scale, result.Loss, loss)
+		}
+		if len(gradients) != len(result.Gradients) {
+			t.Fatalf("scale %g gradient count %d != %d", scale, len(result.Gradients), len(gradients))
+		}
+		for i, gradient := range gradients {
+			want := read(t, gradient.Value)
+			got := result.Gradients[i].ValuesF32
+			if gradient.Name != result.Gradients[i].Name || len(got) != len(want) {
+				t.Fatalf("scale %g gradient %d identity differs", scale, i)
+			}
+			for j := range want {
+				if math.Abs(float64(got[j])-float64(want[j])) > 1e-6+1e-5*math.Abs(float64(want[j])) {
+					t.Fatalf("scale %g gradient %s[%d] %.9g != pre-split %.9g", scale, gradient.Name, j, got[j], want[j])
+				}
+			}
+		}
+		if err := errors.Join(gradients.Close(), snapshot.Close()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCompletionLossIsTheGradientsLossAndChangesNothing(t *testing.T) {
+	f := newFixture(t, torch.Float32)
+	ctx := context.Background()
+	before := baseHash(t, f)
+	adapters := adapterValues(t, f)
+	for _, prompt := range []int{1, 2} {
+		limits := f.limits
+		limits.LogitRows = int64(len(f.tokens) - prompt + 1)
+		loss, err := decoder.CompletionLoss(ctx, f.model, f.tokens, prompt, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		again, err := decoder.CompletionLoss(ctx, f.model, f.tokens, prompt, limits)
+		if err != nil || math.Float64bits(again) != math.Float64bits(loss) {
+			t.Fatalf("prompt %d repeated readout %.17g != %.17g: %v", prompt, again, loss, err)
+		}
+		for _, scale := range []float64{1, 2} {
+			result, err := decoder.CompletionGradient(ctx, f.model, f.tokens, prompt, limits, scale)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if math.Float64bits(result.Loss) != math.Float64bits(loss) {
+				t.Fatalf("prompt %d scale %g readout %.17g != gradient loss %.17g", prompt, scale, loss, result.Loss)
+			}
+		}
+	}
+	if baseHash(t, f) != before {
+		t.Fatal("completion loss changed the frozen base")
+	}
+	after := adapterValues(t, f)
+	for i := range adapters {
+		for j := range adapters[i] {
+			if math.Float32bits(after[i][j]) != math.Float32bits(adapters[i][j]) {
+				t.Fatal("completion loss changed an adapter parameter")
+			}
+		}
+	}
+}
+
+func TestCompletionLossRejectsInvalidMaskAndCancellation(t *testing.T) {
+	f := newFixture(t, torch.Float32)
+	limits := f.limits
+	limits.LogitRows = 3
+	for name, call := range map[string]func() error{
+		"nil model": func() error {
+			_, err := decoder.CompletionLoss(context.Background(), nil, f.tokens, 1, limits)
+			return err
+		},
+		"empty prompt": func() error {
+			_, err := decoder.CompletionLoss(context.Background(), f.model, f.tokens, 0, limits)
+			return err
+		},
+		"empty completion": func() error {
+			_, err := decoder.CompletionLoss(context.Background(), f.model, f.tokens, len(f.tokens), limits)
+			return err
+		},
+		"wrong logit rows": func() error {
+			wrong := limits
+			wrong.LogitRows = 2
+			_, err := decoder.CompletionLoss(context.Background(), f.model, f.tokens, 1, wrong)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.Is(err, decoder.ErrCompletionStep) {
+				t.Fatalf("invalid completion loss request accepted: %v", err)
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	loss, err := decoder.CompletionLoss(ctx, f.model, f.tokens, 1, limits)
+	if !errors.Is(err, context.Canceled) || loss != 0 {
+		t.Fatalf("canceled completion loss=%g err=%v", loss, err)
+	}
+}
