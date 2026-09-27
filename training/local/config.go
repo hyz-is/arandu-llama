@@ -80,16 +80,10 @@ func (c Config) validate() error {
 	if c.FreshStart && (c.InitialCheckpoint != "" || len(c.AdmittedCheckpoints) > 0) || !c.FreshStart && !filepath.IsAbs(c.InitialCheckpoint) {
 		return errors.New("local training: a fresh start loads no checkpoint; any other start names one")
 	}
-	r := c.Recipe
-	if r.Method != "causal-sft-v1" || r.BaseRevision == "" || !validHash(r.DataSHA256) || r.ExampleCount < 1 || r.ExampleCount > 1<<24 || r.MaxMPSBytes < 1 || r.MaxCheckpointBytes < 1 || r.LossScale <= 0 || math.IsNaN(r.LossScale) || math.IsInf(r.LossScale, 0) || r.Digest() == "" || r.Initializer.ExpectedSHA256 != r.Identity.InitialAdapterSHA256 || r.Rotary.MaxTokens < c.MaxTokens {
-		return errors.New("local training: explicit causal SFT recipe required")
+	if c.Recipe.Rotary.MaxTokens < c.MaxTokens {
+		return errRecipe
 	}
-	for _, hash := range []string{r.Identity.IndexSHA256, r.Identity.ConfigSHA256, r.Identity.ReferenceSHA256, r.Identity.InitialAdapterSHA256, r.Rotary.ExpectedSHA256} {
-		if !validHash(hash) {
-			return errors.New("local training: recipe identity missing")
-		}
-	}
-	if err := optim.ValidateAdamWConfig(r.Optimizer); err != nil {
+	if err := c.Recipe.validate(); err != nil {
 		return err
 	}
 	for step, hash := range c.AdmittedCheckpoints {
@@ -98,6 +92,22 @@ func (c Config) validate() error {
 		}
 	}
 	return nil
+}
+
+var errRecipe = errors.New("local training: explicit causal SFT recipe required")
+
+// validate holds the recipe to what every reader of it needs, apart from the
+// token cap a delivery adds on top.
+func (r Recipe) validate() error {
+	if r.Method != "causal-sft-v1" || r.BaseRevision == "" || !validHash(r.DataSHA256) || r.ExampleCount < 1 || r.ExampleCount > 1<<24 || r.MaxMPSBytes < 1 || r.MaxCheckpointBytes < 1 || r.LossScale <= 0 || math.IsNaN(r.LossScale) || math.IsInf(r.LossScale, 0) || r.Digest() == "" || r.Initializer.ExpectedSHA256 != r.Identity.InitialAdapterSHA256 {
+		return errRecipe
+	}
+	for _, hash := range []string{r.Identity.IndexSHA256, r.Identity.ConfigSHA256, r.Identity.ReferenceSHA256, r.Identity.InitialAdapterSHA256, r.Rotary.ExpectedSHA256} {
+		if !validHash(hash) {
+			return errors.New("local training: recipe identity missing")
+		}
+	}
+	return optim.ValidateAdamWConfig(r.Optimizer)
 }
 
 // snapshot owns all slices and maps before validation and execution. Callers
