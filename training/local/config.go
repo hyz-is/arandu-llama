@@ -44,6 +44,11 @@ type Config struct {
 	MaxTokens, MaxSteps                                              int
 	Recipe                                                           Recipe
 	AdmittedCheckpoints                                              map[uint64]string
+	// FreshStart begins at the recipe's pinned initializer with zero AdamW
+	// moments instead of loading InitialCheckpoint, which must then be empty.
+	// It is a field rather than an empty path because an empty path has always
+	// been refused here, and a missing path must not quietly become a new run.
+	FreshStart bool
 }
 
 // Progress identifies the latest complete checkpoint of this delivery.
@@ -67,8 +72,13 @@ func validHash(s string) bool {
 }
 
 func (c Config) validate() error {
-	if !filepath.IsAbs(c.BundleDir) || !filepath.IsAbs(c.ModelDir) || !filepath.IsAbs(c.DataPath) || !filepath.IsAbs(c.CheckpointRoot) || !filepath.IsAbs(c.InitialCheckpoint) || c.MaxTokens < 2 || c.MaxTokens > 4096 || c.MaxSteps < 1 || c.MaxSteps > 20 {
+	if !filepath.IsAbs(c.BundleDir) || !filepath.IsAbs(c.ModelDir) || !filepath.IsAbs(c.DataPath) || !filepath.IsAbs(c.CheckpointRoot) || c.MaxTokens < 2 || c.MaxTokens > 4096 || c.MaxSteps < 1 || c.MaxSteps > 20 {
 		return errors.New("local training: absolute paths and bounded work required")
+	}
+	// A fresh start has no checkpoint to load and no history to admit; any
+	// other start names the checkpoint it continues from.
+	if c.FreshStart && (c.InitialCheckpoint != "" || len(c.AdmittedCheckpoints) > 0) || !c.FreshStart && !filepath.IsAbs(c.InitialCheckpoint) {
+		return errors.New("local training: a fresh start loads no checkpoint; any other start names one")
 	}
 	r := c.Recipe
 	if r.Method != "causal-sft-v1" || r.BaseRevision == "" || !validHash(r.DataSHA256) || r.ExampleCount < 1 || r.ExampleCount > 1<<24 || r.MaxMPSBytes < 1 || r.MaxCheckpointBytes < 1 || r.LossScale <= 0 || math.IsNaN(r.LossScale) || math.IsInf(r.LossScale, 0) || r.Digest() == "" || r.Initializer.ExpectedSHA256 != r.Identity.InitialAdapterSHA256 || r.Rotary.MaxTokens < c.MaxTokens {

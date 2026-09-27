@@ -46,6 +46,14 @@ func curriculumPosition(data, previous string, c Config) ([]example, stepManifes
 	if hex.EncodeToString(hash.Sum(nil)) != c.Recipe.DataSHA256 || len(rows) != c.Recipe.ExampleCount {
 		return nil, stepManifest{}, 0, errors.New("admitted curriculum digest or count differs")
 	}
+	if previous == "" {
+		// Only an explicit fresh start stands before the first example; a
+		// continuation without its checkpoint is refused, not restarted.
+		if !c.FreshStart {
+			return nil, stepManifest{}, 0, errors.New("previous checkpoint required unless starting fresh")
+		}
+		return rows, stepManifest{}, 0, nil
+	}
 	prior, err := readManifest(previous, c)
 	if err != nil {
 		return nil, stepManifest{}, 0, err

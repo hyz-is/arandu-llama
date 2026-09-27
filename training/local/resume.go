@@ -79,6 +79,38 @@ func readFrozenTensorFile(ctx context.Context, path, expectedSHA string, names [
 	return out, nil
 }
 
+// freshAdapter materialises the recipe's pinned initializer in the model's
+// parameter order. The values come from the recipe, never from whatever the
+// model already holds; the caller proves the result through the digest that
+// ReplaceParameters returns, which must equal the initializer's pin.
+func freshAdapter(ctx context.Context, recipe Recipe, names []string, shapes [][]int64) (_ [][]float32, err error) {
+	initial, err := decoder.InitializeAdapter(ctx, recipe.Initializer)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, initial.Close()) }()
+	values := make(map[string][]float32, len(initial.Parameters))
+	for _, parameter := range initial.Parameters {
+		v, err := parameter.Value.Float32Values()
+		if err != nil {
+			return nil, err
+		}
+		values[parameter.Name] = v
+	}
+	if len(values) != len(names) {
+		return nil, errors.New("fresh adapter layout differs from the model")
+	}
+	adapter := make([][]float32, len(names))
+	for i, name := range names {
+		v, ok := values[name]
+		if !ok || int64(len(v)) != shapes[i][0]*shapes[i][1] {
+			return nil, errors.New("fresh adapter layout differs from the model")
+		}
+		adapter[i] = v
+	}
+	return adapter, nil
+}
+
 func resumeNext(ctx context.Context, loaded *decoder.LoadedTextModel, row example, previous, output string, recipe Recipe) error {
 	return resumeNextWithStorage(ctx, loaded, row, previous, output, recipe, nil)
 }
@@ -91,14 +123,6 @@ func resumeNextWithStorage(ctx context.Context, loaded *decoder.LoadedTextModel,
 			fmt.Printf("phase=mps_memory stage=%s current=%d driver=%d recommended=%d\n", phase, stats.CurrentAllocatedBytes, stats.DriverAllocatedBytes, stats.RecommendedMaxBytes)
 		}
 	}
-	body, err := os.ReadFile(filepath.Join(previous, "manifest.json"))
-	if err != nil {
-		return err
-	}
-	var prior stepManifest
-	if err := json.Unmarshal(body, &prior); err != nil || prior.Step == 0 || prior.BaseRevision != recipe.BaseRevision || prior.AdapterFileSHA == "" || prior.OptimizerFileSHA == "" || output == "" && prior.ExampleID != row.ID || output != "" && prior.ExampleID == row.ID {
-		return errors.New("previous checkpoint identity differs")
-	}
 	names := make([]string, len(loaded.Parameters))
 	shapes := make([][]int64, len(loaded.Parameters))
 	for i, parameter := range loaded.Parameters {
@@ -108,33 +132,70 @@ func resumeNextWithStorage(ctx context.Context, loaded *decoder.LoadedTextModel,
 		}
 		names[i], shapes[i] = parameter.Name, info.Shape
 	}
-	adapter, err := readFrozenTensorFile(ctx, filepath.Join(previous, "adapter_model.safetensors"), prior.AdapterFileSHA, names, shapes)
-	if err != nil {
-		return err
-	}
 	momentNames, momentShapes := make([]string, 0, 2*len(names)), make([][]int64, 0, 2*len(names))
 	for i, name := range names {
 		momentNames = append(momentNames, "m."+name, "v."+name)
 		momentShapes = append(momentShapes, shapes[i], shapes[i])
 	}
-	moments, err := readFrozenTensorFile(ctx, filepath.Join(previous, "optimizer_moments.safetensors"), prior.OptimizerFileSHA, momentNames, momentShapes)
-	if err != nil {
-		return err
-	}
-	state := optim.AdamWState{Step: prior.Step}
-	for i := range names {
-		state.Parameters = append(state.Parameters, adapter[i]...)
-		state.First = append(state.First, moments[2*i]...)
-		state.Second = append(state.Second, moments[2*i+1]...)
+	var body []byte
+	var prior stepManifest
+	var adapter [][]float32
+	var state optim.AdamWState
+	if previous == "" {
+		// A fresh start is step 0 of the same AdamW recipe: the pinned
+		// initializer's values, zero moments and a zero step count, so the
+		// first update takes t=1 bias correction exactly as a new optimizer
+		// would. It must write step 1; there is nothing earlier to verify.
+		if output == "" {
+			return errors.New("a fresh start must write its first checkpoint")
+		}
+		var err error
+		if adapter, err = freshAdapter(ctx, recipe, names, shapes); err != nil {
+			return err
+		}
+		prior = stepManifest{BaseRevision: recipe.BaseRevision, UpdatedAdapterSHA: recipe.Initializer.ExpectedSHA256}
+		for i := range names {
+			state.Parameters = append(state.Parameters, adapter[i]...)
+		}
+		state.First = make([]float32, len(state.Parameters))
+		state.Second = make([]float32, len(state.Parameters))
+	} else {
+		var err error
+		if body, err = os.ReadFile(filepath.Join(previous, "manifest.json")); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(body, &prior); err != nil || prior.Step == 0 || prior.BaseRevision != recipe.BaseRevision || prior.AdapterFileSHA == "" || prior.OptimizerFileSHA == "" || output == "" && prior.ExampleID != row.ID || output != "" && prior.ExampleID == row.ID {
+			return errors.New("previous checkpoint identity differs")
+		}
+		if adapter, err = readFrozenTensorFile(ctx, filepath.Join(previous, "adapter_model.safetensors"), prior.AdapterFileSHA, names, shapes); err != nil {
+			return err
+		}
+		moments, err := readFrozenTensorFile(ctx, filepath.Join(previous, "optimizer_moments.safetensors"), prior.OptimizerFileSHA, momentNames, momentShapes)
+		if err != nil {
+			return err
+		}
+		state.Step = prior.Step
+		for i := range names {
+			state.Parameters = append(state.Parameters, adapter[i]...)
+			state.First = append(state.First, moments[2*i]...)
+			state.Second = append(state.Second, moments[2*i+1]...)
+		}
 	}
 	if err := optim.ValidateAdamWState(state); err != nil {
 		return err
 	}
+	// For a fresh start this is the check that the model's adapter layout is
+	// the one the initializer describes: a reordered or reshaped registry
+	// hashes differently from the pin even when every value is right.
 	digest, err := loaded.ReplaceParameters(ctx, state.Parameters)
 	if err != nil || digest != prior.UpdatedAdapterSHA {
 		return errors.New("previous adapter identity differs")
 	}
-	fmt.Printf("phase=resumed step=%d adapter_sha256=%s example=%s\n", prior.Step, digest, row.ID)
+	if previous == "" {
+		fmt.Printf("phase=fresh_start adapter_sha256=%s example=%s\n", digest, row.ID)
+	} else {
+		fmt.Printf("phase=resumed step=%d adapter_sha256=%s example=%s\n", prior.Step, digest, row.ID)
+	}
 	memory("resumed")
 	if output == "" {
 		observed, err := forwardFingerprint(ctx, loaded.Model, row.InputIDs, int64(row.PromptTokens), recipe.MaxCheckpointBytes)

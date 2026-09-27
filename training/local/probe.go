@@ -173,6 +173,12 @@ func run(ctx context.Context, bundle, modelDir, data, output, reload, nextID str
 		}
 	}
 	if nextID != "" {
+		// Resuming a named next example always continues a checkpoint. An empty
+		// reload here would reach the fresh-start path of resumeNext, which only
+		// the admitted curriculum may enter.
+		if reload == "" {
+			return errors.New("resuming the next example requires its previous checkpoint")
+		}
 		return resumeNext(ctx, loaded, row, reload, output, c.Recipe)
 	}
 	if reload != "" {

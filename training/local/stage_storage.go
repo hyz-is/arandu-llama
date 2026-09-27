@@ -162,11 +162,6 @@ func (h *Stage) prepare(ctx context.Context, c pipeline.StageContext) ([]example
 			return nil, err
 		}
 		defer dataRoot.Close()
-		initialRoot, err := stageRoot(h.config.InitialDirectory)
-		if err != nil {
-			return nil, err
-		}
-		defer initialRoot.Close()
 		temp, err := os.MkdirTemp(c.ArtifactDirectory, ".sft-import-")
 		if err != nil {
 			return nil, err
@@ -175,10 +170,19 @@ func (h *Stage) prepare(ctx context.Context, c pipeline.StageContext) ([]example
 		if err := stageCopy(ctx, dataRoot, data.Binding.Artifact, filepath.Join(temp, "data.jsonl")); err != nil {
 			return nil, err
 		}
-		p := h.config.Protocol.Initial
-		for _, a := range []pipeline.StageArtifact{p.Manifest, p.Adapter, p.Optimizer} {
-			if err := stageCopy(ctx, initialRoot, a, filepath.Join(temp, a.Path)); err != nil {
+		// A fresh start imports only its data: the initial adapter is computed
+		// from the recipe's initializer, not copied from anywhere.
+		if !h.config.Protocol.fresh() {
+			initialRoot, err := stageRoot(h.config.InitialDirectory)
+			if err != nil {
 				return nil, err
+			}
+			defer initialRoot.Close()
+			p := h.config.Protocol.Initial
+			for _, a := range []pipeline.StageArtifact{p.Manifest, p.Adapter, p.Optimizer} {
+				if err := stageCopy(ctx, initialRoot, a, filepath.Join(temp, a.Path)); err != nil {
+					return nil, err
+				}
 			}
 		}
 		if err := syncLocalDirectory(temp); err != nil {
@@ -201,7 +205,7 @@ func (h *Stage) prepare(ctx context.Context, c pipeline.StageContext) ([]example
 	if err != nil {
 		return nil, fmt.Errorf("local SFT: tokenized dataset: %w", err)
 	}
-	if _, _, err := h.checkpoint(ctx, root, seed, h.config.Protocol.Initial.Step, rows); err != nil {
+	if _, err := h.initialState(ctx, root, rows); err != nil {
 		return nil, fmt.Errorf("local SFT: initial checkpoint: %w", err)
 	}
 	if err := root.Mkdir(h.outputName(), 0700); err != nil && !errors.Is(err, os.ErrExist) {
@@ -464,13 +468,35 @@ func (h *Stage) syncResult(ctx context.Context, c pipeline.StageContext, result 
 func (h *Stage) seedArtifacts() []pipeline.StageArtifact {
 	p := h.config.Protocol
 	var out []pipeline.StageArtifact
-	for _, a := range []pipeline.StageArtifact{p.Initial.Manifest, p.Initial.Adapter, p.Initial.Optimizer} {
-		a.Path = filepath.Join(h.seedName(), a.Path)
-		out = append(out, a)
+	if !p.fresh() {
+		for _, a := range []pipeline.StageArtifact{p.Initial.Manifest, p.Initial.Adapter, p.Initial.Optimizer} {
+			a.Path = filepath.Join(h.seedName(), a.Path)
+			out = append(out, a)
+		}
 	}
 	a := p.Data.Artifact
 	a.Path = filepath.Join(h.seedName(), "data.jsonl")
 	return append(out, a)
+}
+
+// stepManifest returns a result's own manifest, which follows the seed
+// artifacts. Its position depends on whether the stage started fresh, so it is
+// computed rather than written as a constant index.
+func (h *Stage) stepManifestArtifact(r pipeline.StageResult) pipeline.StageArtifact {
+	return r.Artifacts[len(h.seedArtifacts())]
+}
+
+// initialState is what step Initial.Step+1 continues from: the admitted
+// checkpoint, or for a fresh start the pinned initializer, which has no
+// manifest and whose adapter digest is the initializer's pin. Every later step
+// must change the adapter away from it.
+func (h *Stage) initialState(ctx context.Context, root *os.Root, rows []example) (stepManifest, error) {
+	p := h.config.Protocol
+	if p.fresh() {
+		return stepManifest{BaseRevision: p.Local.BaseRevision, UpdatedAdapterSHA: p.Local.Initializer.ExpectedSHA256}, nil
+	}
+	m, _, e := h.checkpoint(ctx, root, h.seedName(), p.Initial.Step, rows)
+	return m, e
 }
 func (h *Stage) result(step uint64, artifacts []pipeline.StageArtifact, intent pipeline.StageArtifact) pipeline.StageResult {
 	return pipeline.StageResult{Steps: int64(step - h.config.Protocol.Initial.Step), Complete: step == h.config.Protocol.TargetStep, Artifacts: append(append(h.seedArtifacts(), artifacts...), intent)}
@@ -482,7 +508,7 @@ func (h *Stage) scan(ctx context.Context, c pipeline.StageContext, rows []exampl
 	}
 	defer root.Close()
 	p := h.config.Protocol
-	prior, _, e := h.checkpoint(ctx, root, h.seedName(), p.Initial.Step, rows)
+	prior, e := h.initialState(ctx, root, rows)
 	if e != nil {
 		return 0, nil, e
 	}

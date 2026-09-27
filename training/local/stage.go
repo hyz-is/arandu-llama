@@ -113,7 +113,8 @@ type stageDelivery func(context.Context, Config, *stepHooks) error
 var _ pipeline.StageHandler = (*Stage)(nil)
 
 // NewStage snapshots exact configuration without allocating native model state.
-// Starting from zero is unsupported; an admitted adapter and moments are required.
+// A continuation names an admitted adapter and its moments. A fresh start is an
+// empty StageInitial at step 0 and begins at the recipe's pinned initializer.
 func NewStage(c StageConfig) (*Stage, error) { return newStage(c, runStageDelivery) }
 func newStage(c StageConfig, execute stageDelivery) (*Stage, error) {
 	if execute == nil {
@@ -123,7 +124,16 @@ func newStage(c StageConfig, execute stageDelivery) (*Stage, error) {
 	if err != nil || sha != c.ProtocolSHA256 {
 		return nil, errors.Join(ErrStage, err)
 	}
-	for _, p := range []string{c.BundleDirectory, c.ModelDirectory, c.DataDirectory, c.InitialDirectory} {
+	sources := []string{c.BundleDirectory, c.ModelDirectory, c.DataDirectory}
+	if c.Protocol.fresh() {
+		// Nothing is imported for a fresh start, so no source is named for it.
+		if c.InitialDirectory != "" {
+			return nil, ErrStage
+		}
+	} else {
+		sources = append(sources, c.InitialDirectory)
+	}
+	for _, p := range sources {
 		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
 			return nil, ErrStage
 		}
@@ -156,14 +166,23 @@ func newStage(c StageConfig, execute stageDelivery) (*Stage, error) {
 func (p StageProtocol) validate() error {
 	l := p.Limits
 	if p.Version != 1 || !validHash(p.RecipeSHA256) || !validHash(p.PlacementSHA256) || !validHash(p.QualificationSHA256) || !stageID(p.StageID) ||
-		p.Initial.Step < 1 || p.TargetStep <= p.Initial.Step || p.TargetStep > uint64(p.Local.ExampleCount) || p.TargetStep-p.Initial.Step > uint64(l.MaxSteps) ||
+		p.TargetStep <= p.Initial.Step || p.TargetStep > uint64(p.Local.ExampleCount) || p.TargetStep-p.Initial.Step > uint64(l.MaxSteps) ||
 		p.DeliverySteps < 1 || p.DeliverySteps > 20 || l.MaxSteps < 1 || l.MaxSteps > 1_000_000 || l.MaxProtocolBytes < 1 || l.MaxProtocolBytes > 64<<20 ||
 		l.MaxDataBytes < 1 || l.MaxDataBytes > 256<<20 || l.MaxMetadataBytes < 1 || l.MaxMetadataBytes > 16<<20 || l.MaxManifestBytes < 1 || l.MaxManifestBytes > 1<<20 || l.MaxTensorFileBytes < 1 || l.MaxTensorFileBytes > 1<<40 ||
 		l.MaxDataTokens < 1 || l.MaxDataTokens > 1<<30 || l.MaxParameters < 1 || l.MaxParameters > 1<<30 || l.WorkingBytes < 1 ||
 		p.Data.Kind != pipeline.BindingDerivedInput || p.Data.ValidateBounds(l.MaxDataBytes) != nil || p.Data.Artifact.SHA256 != p.Local.DataSHA256 ||
-		p.Initial.Manifest.Path != "manifest.json" || p.Initial.Adapter.Path != "adapter_model.safetensors" || p.Initial.Optimizer.Path != "optimizer_moments.safetensors" ||
-		!stageArtifact(p.Initial.Manifest, l.MaxManifestBytes) || !stageArtifact(p.Initial.Adapter, l.MaxTensorFileBytes) || !stageArtifact(p.Initial.Optimizer, l.MaxTensorFileBytes) ||
 		p.Local.BaseRevision != p.Student.Revision || !validHash(p.Student.WeightsSHA256) || !validHash(p.Student.TokenizerSHA256) || !validHash(p.Student.TemplateSHA256) || !validHash(p.Student.RuntimeSHA256) || p.Student.Vocabulary < 2 {
+		return ErrStage
+	}
+	// Step 0 is a fresh start only when nothing else is declared: a manifest,
+	// adapter, moments or historical admission beside it would be a
+	// continuation that forgot its step, and is refused rather than guessed.
+	if p.fresh() {
+		if p.Initial != (StageInitial{}) {
+			return ErrStage
+		}
+	} else if p.Initial.Manifest.Path != "manifest.json" || p.Initial.Adapter.Path != "adapter_model.safetensors" || p.Initial.Optimizer.Path != "optimizer_moments.safetensors" ||
+		!stageArtifact(p.Initial.Manifest, l.MaxManifestBytes) || !stageArtifact(p.Initial.Adapter, l.MaxTensorFileBytes) || !stageArtifact(p.Initial.Optimizer, l.MaxTensorFileBytes) {
 		return ErrStage
 	}
 	ck := l.Checkpoint
@@ -238,12 +257,19 @@ func (h *Stage) localConfig(root string, step uint64) Config {
 	c := Config{BundleDir: h.config.BundleDirectory, ModelDir: h.config.ModelDirectory, DataPath: filepath.Join(root, h.seedName(), "data.jsonl"), CheckpointRoot: filepath.Join(root, h.outputName()), InitialCheckpoint: filepath.Join(root, h.seedName()), MaxTokens: h.stage.MaxTokens, MaxSteps: min(p.DeliverySteps, int(p.TargetStep-step)), Recipe: p.Local}
 	if step > p.Initial.Step {
 		c.InitialCheckpoint = filepath.Join(c.CheckpointRoot, fmt.Sprintf("step-%03d", step))
+	} else if p.fresh() {
+		// Nothing has been written yet: the delivery starts at the initializer.
+		c.InitialCheckpoint, c.FreshStart = "", true
 	}
 	if p.Initial.AllowHistorical {
 		c.AdmittedCheckpoints = map[uint64]string{p.Initial.Step: p.Initial.Manifest.SHA256}
 	}
 	return c
 }
+
+// fresh reports a start at the recipe's initializer, before any checkpoint.
+func (p StageProtocol) fresh() bool { return p.Initial.Step == 0 }
+
 func (h *Stage) seedName() string   { return "sft-" + h.stage.ID + "-initial" }
 func (h *Stage) outputName() string { return "sft-" + h.stage.ID }
 func (h *Stage) stepName(n uint64) string {

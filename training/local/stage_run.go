@@ -116,19 +116,22 @@ func (h *Stage) Run(ctx context.Context, c pipeline.StageContext, commit func(co
 	if e != nil {
 		return fmt.Errorf("local SFT: reconciling continuation: %w", e)
 	}
+	// A fresh start has no manifest before step 1, so its chain begins empty.
 	previousSHA := h.config.Protocol.Initial.Manifest.SHA256
 	if len(results) > 0 {
-		previousSHA = results[len(results)-1].Artifacts[4].SHA256
+		previousSHA = h.stepManifestArtifact(results[len(results)-1]).SHA256
 	}
 	root, e := stageRoot(c.ArtifactDirectory)
 	if e != nil {
 		return e
 	}
-	priorPath := h.seedName()
+	var prior stepManifest
+	var readErr error
 	if last > h.config.Protocol.Initial.Step {
-		priorPath = h.stepName(last)
+		prior, _, readErr = h.checkpoint(ctx, root, h.stepName(last), last, rows)
+	} else {
+		prior, readErr = h.initialState(ctx, root, rows)
 	}
-	prior, _, readErr := h.checkpoint(ctx, root, priorPath, last, rows)
 	if e := errors.Join(readErr, root.Close()); e != nil {
 		return e
 	}
