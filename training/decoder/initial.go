@@ -47,7 +47,7 @@ type InitialParameter struct {
 
 // InitialAdapter owns the explicitly requested FP32 projection tensors.
 // SHA256 hashes each UTF-8 name followed by its contiguous FP32 CPU bytes, in
-// parameter order (layer, q/v projection, A/B). It qualifies initial bytes only.
+// parameter order (layer, projection, A/B). It qualifies initial bytes only.
 type InitialAdapter struct {
 	Parameters []InitialParameter
 	SHA256     string

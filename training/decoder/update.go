@@ -125,17 +125,22 @@ func (m *LoadedTextModel) ReplaceParameters(ctx context.Context, values []float3
 	if start != int64(len(raw)) {
 		return "", ErrParameters
 	}
-	var layerIndices []int
-	for i, layer := range m.Model.Layers {
-		if layer.Adapter != nil {
-			layerIndices = append(layerIndices, i)
+	// Each adapted layer gets a copy of its adapter with every pair replaced
+	// in registry order; alpha and the pair layout are carried unchanged.
+	nextAdapters := make(map[int]*layers.AttentionLoRA)
+	for i, slot := range adapterRegistry(m.Model) {
+		adapter := nextAdapters[slot.layer]
+		if adapter == nil {
+			copied := *m.Model.Layers[slot.layer].Adapter
+			adapter = &copied
+			nextAdapters[slot.layer] = adapter
 		}
-	}
-	nextAdapters := make([]*layers.AttentionLoRA, len(layerIndices))
-	for i := range nextAdapters {
-		base := i * 4
-		nextAdapters[i] = &layers.AttentionLoRA{QueryA: prepared[base].Value, QueryB: prepared[base+1].Value,
-			ValueA: prepared[base+2].Value, ValueB: prepared[base+3].Value, Alpha: m.Model.Layers[layerIndices[i]].Adapter.Alpha}
+		a, b := adapter.Pair(slot.target)
+		if slot.b {
+			*b = prepared[i].Value
+		} else {
+			*a = prepared[i].Value
+		}
 	}
 	nextOwned := make([]*torch.Tensor, 0, len(m.owned)+len(prepared))
 	if len(m.owned) == 0 {
@@ -158,8 +163,8 @@ func (m *LoadedTextModel) ReplaceParameters(ctx context.Context, values []float3
 	// Commit consists only of Go assignments; no fallible native operation or
 	// cancellation point can expose a partially replaced parameter registry.
 	old := m.Parameters
-	for i, adapter := range nextAdapters {
-		m.Model.Layers[layerIndices[i]].Adapter = adapter
+	for layer, adapter := range nextAdapters {
+		m.Model.Layers[layer].Adapter = adapter
 	}
 	m.Parameters, m.owned = prepared, nextOwned
 	m.Model.generation++
@@ -180,38 +185,39 @@ func (m *LoadedTextModel) ReplaceParameters(ctx context.Context, values []float3
 func (m *LoadedTextModel) validateParameterRegistry(ctx context.Context, expected []AssemblyTensor) ([]torch.Device, map[torch.Tensor]int, error) {
 	devices := make([]torch.Device, len(expected))
 	oldIndex := make(map[torch.Tensor]int, len(expected))
-	var layerIndices []int
-	for i, layer := range m.Model.Layers {
-		if layer.Adapter != nil {
-			if layer.Adapter.Alpha <= 0 || math.IsNaN(layer.Adapter.Alpha) || math.IsInf(layer.Adapter.Alpha, 0) {
-				return nil, nil, ErrParameters
+	for _, layer := range m.Model.Layers {
+		if layer.Adapter == nil {
+			continue
+		}
+		if layer.Adapter.Alpha <= 0 || math.IsNaN(layer.Adapter.Alpha) || math.IsInf(layer.Adapter.Alpha, 0) {
+			return nil, nil, ErrParameters
+		}
+		for _, target := range layer.Adapter.Targets() {
+			pairA, pairB := layer.Adapter.Pair(target)
+			a, err := (*pairA).Info()
+			if err != nil {
+				return nil, nil, errors.Join(ErrParameters, err)
 			}
-			for _, pair := range [][2]*torch.Tensor{{layer.Adapter.QueryA, layer.Adapter.QueryB}, {layer.Adapter.ValueA, layer.Adapter.ValueB}} {
-				a, err := pair[0].Info()
-				if err != nil {
-					return nil, nil, errors.Join(ErrParameters, err)
-				}
-				b, err := pair[1].Info()
-				if err != nil {
-					return nil, nil, errors.Join(ErrParameters, err)
-				}
-				if len(a.Shape) != 2 || len(b.Shape) != 2 || a.Shape[0] != b.Shape[1] {
-					return nil, nil, fmt.Errorf("%w: projection rank differs", ErrParameters)
-				}
+			b, err := (*pairB).Info()
+			if err != nil {
+				return nil, nil, errors.Join(ErrParameters, err)
 			}
-			layerIndices = append(layerIndices, i)
+			if len(a.Shape) != 2 || len(b.Shape) != 2 || a.Shape[0] != b.Shape[1] {
+				return nil, nil, fmt.Errorf("%w: projection rank differs", ErrParameters)
+			}
 		}
 	}
-
+	registry := adapterRegistry(m.Model)
+	if len(registry) != len(expected) {
+		return nil, nil, fmt.Errorf("%w: parameter names/order/references differ", ErrParameters)
+	}
 	for i, item := range expected {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
 		parameter := m.Parameters[i]
-		layer := m.Model.Layers[layerIndices[i/4]]
-		a := layer.Adapter
-		references := [4]*torch.Tensor{a.QueryA, a.QueryB, a.ValueA, a.ValueB}
-		if parameter.Name != item.ReferenceName || parameter.Value == nil || references[i%4] != parameter.Value {
+		layer := m.Model.Layers[registry[i].layer]
+		if parameter.Name != item.ReferenceName || parameter.Value == nil || registry[i].value != parameter.Value {
 			return nil, nil, fmt.Errorf("%w: parameter names/order/references differ", ErrParameters)
 		}
 		if _, duplicate := oldIndex[*parameter.Value]; duplicate {

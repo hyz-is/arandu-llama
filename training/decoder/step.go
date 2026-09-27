@@ -29,7 +29,8 @@ type CandidateParameterGradient struct {
 
 // CandidateGradientResult contains observed raw logits and ordered parameter
 // derivatives. It contains no native handles or optimizer updates. Names follow
-// model layer order, q/v projection, then A/B; registry size is caller-owned.
+// model layer order, canonical projection order, then A/B; registry size is
+// caller-owned.
 type CandidateGradientResult struct {
 	Logits    [4]float64
 	Gradients []CandidateParameterGradient
@@ -245,27 +246,15 @@ type candidateParameter struct {
 
 func candidateParameters(model *TextModel) ([]candidateParameter, error) {
 	var result []candidateParameter
-	for index, layer := range model.Layers {
-		if layer.Adapter == nil {
-			continue
+	for _, slot := range adapterRegistry(model) {
+		info, err := slot.value.Info()
+		if err != nil {
+			return nil, err
 		}
-		prefix := fmt.Sprintf("base_model.model.model.language_model.layers.%d.self_attn.", index)
-		for _, parameter := range []struct {
-			suffix string
-			value  *torch.Tensor
-		}{
-			{"q_proj.lora_A.default.weight", layer.Adapter.QueryA}, {"q_proj.lora_B.default.weight", layer.Adapter.QueryB},
-			{"v_proj.lora_A.default.weight", layer.Adapter.ValueA}, {"v_proj.lora_B.default.weight", layer.Adapter.ValueB},
-		} {
-			info, err := parameter.value.Info()
-			if err != nil {
-				return nil, err
-			}
-			if !info.RequiresGrad || info.DType != torch.Float32 || info.Elements <= 0 {
-				return nil, fmt.Errorf("%w: expected trainable FP32 adapter", ErrCandidateStep)
-			}
-			result = append(result, candidateParameter{name: prefix + parameter.suffix, info: info})
+		if !info.RequiresGrad || info.DType != torch.Float32 || info.Elements <= 0 {
+			return nil, fmt.Errorf("%w: expected trainable FP32 adapter", ErrCandidateStep)
 		}
+		result = append(result, candidateParameter{name: slot.name, info: info})
 	}
 	if len(result) == 0 {
 		return nil, fmt.Errorf("%w: trainable adapters required", ErrCandidateStep)

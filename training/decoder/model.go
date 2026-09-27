@@ -294,22 +294,26 @@ func (m *TextModel) vjp(ctx context.Context, snapshot *Snapshot, logitCotangent 
 		_ = current.Close()
 		current, gradient.Input = gradient.Input, nil
 	}
+	// The registry fixes names and order; each gradient leaves its layer's
+	// owner as it joins the result, so exactly one of them closes it.
 	var result Gradients
-	for index, gradients := range byLayer {
-		if gradients == nil || m.Layers[index].Adapter == nil {
-			continue
+	for _, slot := range adapterRegistry(m) {
+		gradients := byLayer[slot.layer]
+		if gradients == nil {
+			_ = result.Close()
+			return nil, fmt.Errorf("decoder: layer %d adapter gradients missing", slot.layer)
 		}
-		prefix := fmt.Sprintf("base_model.model.model.language_model.layers.%d.self_attn.", index)
-		for _, item := range []struct {
-			name  string
-			value **torch.Tensor
-		}{
-			{"q_proj.lora_A.default.weight", &gradients.QueryA}, {"q_proj.lora_B.default.weight", &gradients.QueryB},
-			{"v_proj.lora_A.default.weight", &gradients.ValueA}, {"v_proj.lora_B.default.weight", &gradients.ValueB},
-		} {
-			result = append(result, ParameterGradient{Name: prefix + item.name, Value: *item.value})
-			*item.value = nil
+		a, b := gradients.Pair(slot.target)
+		value := a
+		if slot.b {
+			value = b
 		}
+		if *value == nil {
+			_ = result.Close()
+			return nil, fmt.Errorf("decoder: layer %d adapter gradient missing", slot.layer)
+		}
+		result = append(result, ParameterGradient{Name: slot.name, Value: *value})
+		*value = nil
 	}
 	return result, nil
 }
