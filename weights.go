@@ -386,15 +386,17 @@ func (m *Model) ChatTemplate() string {
 	return C.GoString(cTemplate)
 }
 
-// FormatChatPrompt formats chat messages using the model's chat template.
-//
-// This method applies the chat template to the provided messages and returns
-// the resulting prompt string without performing generation. Useful for:
+// FormatChatPrompt formats chat messages exactly as Chat and ChatStream do,
+// and returns the prompt without performing generation. Useful for:
 //   - Debugging what will be sent to the model
 //   - Pre-computing prompts for caching
-//   - Understanding how the template formats conversations
+//   - Finding where the generation prompt ends and an answer would begin
 //
-// The template priority is: opts.ChatTemplate > model's GGUF template > error.
+// The template is opts.ChatTemplate when set and the model's own GGUF template
+// otherwise; a model with neither is an error. Either is rendered by the Jinja
+// engine ChatTemplateEngine names, with the model's BOS and EOS pieces, and a
+// template that fails to render is an error rather than a prompt from another
+// formatter.
 //
 // See also: Context.Chat for performing chat completion with generation.
 //
@@ -407,99 +409,8 @@ func (m *Model) ChatTemplate() string {
 //	prompt, err := model.FormatChatPrompt(messages, llama.ChatOptions{})
 //	fmt.Println("Formatted prompt:", prompt)
 func (m *Model) FormatChatPrompt(messages []ChatMessage, opts ChatOptions) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if m.closed {
-		return "", fmt.Errorf("model is closed")
-	}
-
-	// Use the same template resolution logic as Chat/ChatStream
-	template := opts.ChatTemplate
-	if template == "" {
-		template = m.ChatTemplate()
-	}
-	if template == "" {
-		return "", fmt.Errorf("no chat template available: provide ChatOptions.ChatTemplate or use a model with embedded template")
-	}
-
-	// Apply template with addAssistant=true (same as generation)
-	return applyChatTemplate(template, messages, true)
-}
-
-// getChatFormat gets the auto-detected chat format for reasoning parsing.
-// This is cached on the model to avoid repeated detection.
-func (m *Model) getChatFormat() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Initialize templates if not cached
-	if m.chatTemplates == nil {
-		m.chatTemplates = C.llama_wrapper_chat_templates_init(m.modelPtr, nil)
-		if m.chatTemplates == nil {
-			// Fallback to CONTENT_ONLY if init fails
-			return int(C.LLAMA_CHAT_FORMAT_CONTENT_ONLY)
-		}
-	}
-
-	return int(C.llama_wrapper_chat_templates_get_format(m.chatTemplates))
-}
-
-// applyChatTemplate applies a Jinja2 chat template to messages.
-//
-// This is an internal helper that wraps llama.cpp's native chat template system.
-// The template can be from GGUF metadata or a custom Jinja2 template string.
-//
-// Returns the formatted prompt string ready for generation, or an error if
-// template application fails.
-func applyChatTemplate(template string, messages []ChatMessage, addAssistant bool) (string, error) {
-	if template == "" {
-		return "", fmt.Errorf("template cannot be empty")
-	}
-	if len(messages) == 0 {
-		return "", fmt.Errorf("messages cannot be empty")
-	}
-
-	// Convert template to C string
-	cTemplate := C.CString(template)
-	defer C.free(unsafe.Pointer(cTemplate))
-
-	// Build C arrays for roles and contents
-	cRoles := make([]*C.char, len(messages))
-	cContents := make([]*C.char, len(messages))
-
-	// Allocate C strings and set up defer cleanup
-	for i, msg := range messages {
-		cRoles[i] = C.CString(msg.Role)
-		cContents[i] = C.CString(msg.Content)
-	}
-
-	// Defer cleanup of all C strings
-	defer func() {
-		for i := range messages {
-			C.free(unsafe.Pointer(cRoles[i]))
-			C.free(unsafe.Pointer(cContents[i]))
-		}
-	}()
-
-	// Call C function to apply template
-	cResult := C.llama_wrapper_apply_chat_template(
-		cTemplate,
-		(**C.char)(unsafe.Pointer(&cRoles[0])),
-		(**C.char)(unsafe.Pointer(&cContents[0])),
-		C.int(len(messages)),
-		C.bool(addAssistant),
-	)
-
-	if cResult == nil {
-		return "", fmt.Errorf("failed to apply chat template: %s", C.GoString(C.llama_wrapper_last_error()))
-	}
-
-	// Convert result and free
-	result := C.GoString(cResult)
-	C.llama_wrapper_free_result(cResult)
-
-	return result, nil
+	prompt, _, err := formatChatMessages(m, messages, opts)
+	return prompt, err
 }
 
 // Describe returns how the model names its own quantisation, in the form

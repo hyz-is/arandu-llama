@@ -144,7 +144,6 @@ int llama_wrapper_model_n_embd(void* model);
 
 // Chat template support
 const char* llama_wrapper_get_chat_template(void* model);
-char* llama_wrapper_apply_chat_template(const char* tmpl, const char** roles, const char** contents, int n_messages, bool add_assistant);
 
 // Reasoning content parsing
 typedef enum {
@@ -171,13 +170,30 @@ llama_wrapper_parsed_message* llama_wrapper_parse_reasoning(
 
 void llama_wrapper_free_parsed_message(llama_wrapper_parsed_message* msg);
 
-// Chat format auto-detection from model metadata
+// Chat templates rendered by llama.cpp's Jinja engine (common/chat).
+// init takes a model, a template override, or both; with no model the override
+// is parsed alone and bos_token/eos_token are empty. With a model and no
+// override a model without a template is given ChatML, so check
+// llama_wrapper_get_chat_template first. Returns NULL on error.
 void* llama_wrapper_chat_templates_init(void* model, const char* template_override);
 void llama_wrapper_chat_templates_free(void* templates);
-int llama_wrapper_chat_templates_get_format(void* templates);
-
-// Chat format constants (values match common_chat_format enum in llama.cpp/common/chat.h)
-#define LLAMA_CHAT_FORMAT_CONTENT_ONLY 0
+// Renders the messages and returns the prompt (free with
+// llama_wrapper_free_result), writing the detected common_chat_format to
+// format_out when it is not NULL. enable_thinking is -1 for llama-server's
+// default, 0 or 1 to set it; kwarg values are JSON text. Returns NULL on error
+// with llama_wrapper_last_error set; there is no fallback formatter.
+char* llama_wrapper_chat_templates_render(
+    void* templates,
+    const char** roles,
+    const char** contents,
+    int n_messages,
+    bool add_generation_prompt,
+    int enable_thinking,
+    const char** kwarg_names,
+    const char** kwarg_values,
+    int n_kwargs,
+    int* format_out
+);
 
 // Model metadata access
 const char* llama_wrapper_model_meta_string(void* model, const char* key);

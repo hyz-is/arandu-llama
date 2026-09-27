@@ -1349,77 +1349,6 @@ const char* llama_wrapper_get_chat_template(void* model) {
     return tmpl;  // May be nullptr if model has no template
 }
 
-// Apply chat template to messages
-// Returns allocated string with formatted prompt (caller must free with llama_wrapper_free_result)
-// Returns nullptr on error
-char* llama_wrapper_apply_chat_template(const char* tmpl, const char** roles, const char** contents, int n_messages, bool add_assistant) {
-    if (!tmpl || !roles || !contents || n_messages < 0) {
-        g_last_error = "Invalid parameters for chat template application";
-        return nullptr;
-    }
-
-    try {
-        // Build array of llama_chat_message structs
-        std::vector<llama_chat_message> messages;
-        messages.reserve(n_messages);
-
-        for (int i = 0; i < n_messages; i++) {
-            if (!roles[i] || !contents[i]) {
-                g_last_error = "Role or content cannot be null";
-                return nullptr;
-            }
-            messages.push_back({roles[i], contents[i]});
-        }
-
-        // Start with a reasonable buffer size (8KB)
-        std::vector<char> buffer(8192);
-
-        // Try to apply template
-        int32_t result_len = llama_chat_apply_template(
-            tmpl,
-            messages.data(),
-            n_messages,
-            add_assistant,
-            buffer.data(),
-            buffer.size()
-        );
-
-        // If buffer was too small, resize and retry
-        if (result_len > (int32_t)buffer.size()) {
-            buffer.resize(result_len);
-            result_len = llama_chat_apply_template(
-                tmpl,
-                messages.data(),
-                n_messages,
-                add_assistant,
-                buffer.data(),
-                buffer.size()
-            );
-        }
-
-        // Check for errors
-        if (result_len < 0) {
-            g_last_error = "Failed to apply chat template (template detection or application error)";
-            return nullptr;
-        }
-
-        // Allocate result and copy
-        char* c_result = (char*)malloc(result_len + 1);
-        if (c_result) {
-            memcpy(c_result, buffer.data(), result_len);
-            c_result[result_len] = '\0';
-        } else {
-            g_last_error = "Failed to allocate memory for chat template result";
-            return nullptr;
-        }
-
-        return c_result;
-    } catch (const std::exception& e) {
-        g_last_error = "Exception during chat template application: " + std::string(e.what());
-        return nullptr;
-    }
-}
-
 // Parse model output to extract reasoning/thinking content
 // Returns NULL on error. Free result with llama_wrapper_free_parsed_message()
 llama_wrapper_parsed_message* llama_wrapper_parse_reasoning(
@@ -1470,14 +1399,45 @@ void llama_wrapper_free_parsed_message(llama_wrapper_parsed_message* msg) {
     delete msg;
 }
 
+// Parse a chat template for llama.cpp's Jinja engine. A model supplies its own
+// template and the BOS/EOS pieces the template may write; without one the
+// override is parsed alone and those pieces are empty. With a model and no
+// override, common_chat_templates_init substitutes ChatML when the model has
+// no template, so callers that must not render a template the model does not
+// carry check llama_wrapper_get_chat_template first.
 void* llama_wrapper_chat_templates_init(void* model, const char* template_override) {
-    if (!model) return nullptr;
-
-    auto model_wrapper = static_cast<llama_wrapper_model_t*>(model);
     std::string tmpl_override = template_override ? template_override : "";
+    if (!model && tmpl_override.empty()) {
+        g_last_error = "A chat template needs a model or a template override";
+        return nullptr;
+    }
 
-    auto templates = common_chat_templates_init(model_wrapper->model, tmpl_override);
-    return templates.release();  // Transfer ownership
+    const llama_model* llm = model ? static_cast<llama_wrapper_model_t*>(model)->model : nullptr;
+    try {
+        auto templates = common_chat_templates_init(llm, tmpl_override);
+        return templates.release();  // Transfer ownership
+    } catch (const std::exception& e) {
+        // common_chat_templates_init rethrows the parser's exception by value
+        // as std::exception, which leaves what() reading "std::exception".
+        // Parsing the source again recovers the message worth reporting.
+        std::string message = e.what();
+        std::string source = tmpl_override;
+        if (source.empty() && llm) {
+            const char* own = llama_model_chat_template(llm, nullptr);
+            source = own ? own : "";
+        }
+        try {
+            common_chat_template probe(source, "", "");
+        } catch (const std::exception& parse) {
+            message = parse.what();
+        } catch (...) {
+        }
+        g_last_error = "Failed to parse chat template: " + message;
+        return nullptr;
+    } catch (...) {
+        g_last_error = "Failed to parse chat template: unknown exception";
+        return nullptr;
+    }
 }
 
 void llama_wrapper_chat_templates_free(void* templates) {
@@ -1485,29 +1445,87 @@ void llama_wrapper_chat_templates_free(void* templates) {
     common_chat_templates_free(static_cast<common_chat_templates*>(templates));
 }
 
-int llama_wrapper_chat_templates_get_format(void* templates) {
-    if (!templates) return 0;  // COMMON_CHAT_FORMAT_CONTENT_ONLY = 0
-
-    auto tmpl = static_cast<common_chat_templates*>(templates);
+// Render messages through the parsed template with llama.cpp's Jinja engine,
+// the path llama-server takes with --jinja. The legacy llama_chat_apply_template
+// is not a fallback: it matches the template against known formats and writes
+// its own rendering of the one it guesses, which is a different prompt from the
+// template's for any family it only approximates and an error for the rest.
+//
+// enable_thinking is -1 for llama-server's default (on when the template
+// supports thinking), 0 or 1 to set it. Each kwarg value is JSON text.
+char* llama_wrapper_chat_templates_render(
+    void* templates,
+    const char** roles,
+    const char** contents,
+    int n_messages,
+    bool add_generation_prompt,
+    int enable_thinking,
+    const char** kwarg_names,
+    const char** kwarg_values,
+    int n_kwargs,
+    int* format_out
+) {
+    if (!templates) {
+        g_last_error = "Chat templates cannot be null";
+        return nullptr;
+    }
+    if (!roles || !contents || n_messages <= 0) {
+        g_last_error = "Chat messages cannot be empty";
+        return nullptr;
+    }
+    if (n_kwargs < 0 || (n_kwargs > 0 && (!kwarg_names || !kwarg_values))) {
+        g_last_error = "Invalid chat template kwargs";
+        return nullptr;
+    }
 
     try {
-        // Apply with minimal dummy messages just to trigger format detection
+        auto tmpls = static_cast<common_chat_templates*>(templates);
+
         common_chat_templates_inputs inputs;
         inputs.use_jinja = true;
-        inputs.add_generation_prompt = true;
+        inputs.add_generation_prompt = add_generation_prompt;
+        inputs.messages.reserve(n_messages);
+        for (int i = 0; i < n_messages; i++) {
+            if (!roles[i] || !contents[i]) {
+                g_last_error = "Role or content cannot be null";
+                return nullptr;
+            }
+            common_chat_msg msg;
+            msg.role = roles[i];
+            msg.content = contents[i];
+            inputs.messages.push_back(std::move(msg));
+        }
+        for (int i = 0; i < n_kwargs; i++) {
+            if (!kwarg_names[i] || !kwarg_values[i]) {
+                g_last_error = "Chat template kwarg name or value cannot be null";
+                return nullptr;
+            }
+            inputs.chat_template_kwargs[kwarg_names[i]] = kwarg_values[i];
+        }
+        inputs.enable_thinking = enable_thinking < 0
+            ? common_chat_templates_support_enable_thinking(tmpls)
+            : enable_thinking != 0;
 
-        // Create a minimal dummy message to satisfy template application
-        common_chat_msg dummy_msg;
-        dummy_msg.role = "user";
-        dummy_msg.content = "test";  // Non-empty to avoid potential issues
-        inputs.messages.push_back(dummy_msg);
+        common_chat_params params = common_chat_templates_apply(tmpls, inputs);
 
-        auto params = common_chat_templates_apply(tmpl, inputs);
-        return static_cast<int>(params.format);
+        char* result = static_cast<char*>(malloc(params.prompt.size() + 1));
+        if (!result) {
+            g_last_error = "Failed to allocate memory for chat template result";
+            return nullptr;
+        }
+        memcpy(result, params.prompt.data(), params.prompt.size());
+        result[params.prompt.size()] = '\0';
+
+        if (format_out) {
+            *format_out = static_cast<int>(params.format);
+        }
+        return result;
     } catch (const std::exception& e) {
-        // If template application fails, return CONTENT_ONLY as fallback
-        g_last_error = "Format detection failed: " + std::string(e.what());
-        return 0;  // COMMON_CHAT_FORMAT_CONTENT_ONLY
+        g_last_error = "Failed to render chat template: " + std::string(e.what());
+        return nullptr;
+    } catch (...) {
+        g_last_error = "Failed to render chat template: unknown exception";
+        return nullptr;
     }
 }
 

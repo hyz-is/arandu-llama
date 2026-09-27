@@ -22,19 +22,20 @@ type ChatOptions struct {
 	Seed        *int     // Random seed for reproducible generation (nil = random)
 	StopWords   []string // Additional stop sequences beyond model defaults
 
-	// Chat template (Jinja2 template string)
+	// Chat template (Jinja source), rendered by llama.cpp's Jinja engine.
 	// If empty, uses model's GGUF template. If model has no template, returns error.
-	// Supports 40+ formats: chatml, llama2, llama3, mistral, gemma, phi3, etc.
-	// See: https://github.com/ggerganov/llama.cpp/blob/master/common/chat.cpp
+	// A format name such as "chatml" or "llama3" is refused: names selected
+	// llama.cpp's legacy formatter, which is not used.
 	ChatTemplate string
 
 	// Chat template variables (arbitrary JSON-compatible key-value pairs)
-	// These are passed to the model's Jinja2 chat template for customisation.
-	// Common examples: {"add_generation_prompt": true, "tools": [...]}
+	// These are passed to the chat template as Jinja variables, each value
+	// encoded as JSON. Example: {"reasoning_effort": "low"}. An
+	// "enable_thinking" entry must be a bool and agree with EnableThinking.
 	ChatTemplateKwargs map[string]interface{}
 
 	// Reasoning model options (for models like DeepSeek-R1)
-	EnableThinking  *bool           // Enable/disable thinking output (nil = model default)
+	EnableThinking  *bool           // Template's enable_thinking (nil = llama-server's default: on when the template supports thinking)
 	ReasoningBudget *int            // Token limit for reasoning (-1 = unlimited, 0 = disabled)
 	ReasoningFormat ReasoningFormat // How to handle reasoning content
 
