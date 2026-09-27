@@ -23,6 +23,8 @@ func tensor32(t *testing.T, data []float64, shape []int64, grad bool) *torch.Ten
 type attentionFixture struct {
 	x, q, k, v, out, qnorm, knorm, cosine, sine []float64
 	qa, qb, va, vb                              []float64
+	// Key and output pairs are absent unless a test sets them.
+	ka, kb, oa, ob []float64
 }
 
 func fixture() attentionFixture {
@@ -62,7 +64,7 @@ func attentionReference(f attentionFixture) []float64 {
 		}
 		return result
 	}
-	qraw, keys, vals := project(f.q, f.qa, f.qb, 16), project(f.k, nil, nil, 4), project(f.v, f.va, f.vb, 4)
+	qraw, keys, vals := project(f.q, f.qa, f.qb, 16), project(f.k, f.ka, f.kb, 4), project(f.v, f.va, f.vb, 4)
 	queries := make([][]float64, 3)
 	normalizeRotate := func(vector []float64, weight []float64, token int) {
 		inverse := 1 / math.Sqrt((vector[0]*vector[0]+vector[1]*vector[1])/2+1e-6)
@@ -105,7 +107,13 @@ func attentionReference(f attentionFixture) []float64 {
 		}
 		for output := range 2 {
 			for input := range 8 {
-				result[token*2+output] += f.out[output*8+input] * joined[input]
+				weight := f.out[output*8+input]
+				if f.oa != nil {
+					for rank := range 4 {
+						weight += 2 * f.ob[output*4+rank] * f.oa[rank*8+input]
+					}
+				}
+				result[token*2+output] += weight * joined[input]
 			}
 		}
 	}

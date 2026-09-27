@@ -204,6 +204,12 @@ func FeedForward(x, gateWeight, upWeight, downWeight *torch.Tensor) (*torch.Tens
 // their exponent range on Turing devices, where native BFloat16 execution is
 // unavailable, without changing the admitted Float16 residual checkpoints.
 func FeedForwardPromoted(x, gateWeight, upWeight, downWeight *torch.Tensor) (*torch.Tensor, error) {
+	return feedForwardPromoted(x, gateWeight, upWeight, downWeight, nil, 0)
+}
+
+// feedForwardPromoted adds the optional adapter's pairs to the promoted
+// Float32 projections. A nil adapter runs exactly FeedForwardPromoted.
+func feedForwardPromoted(x, gateWeight, upWeight, downWeight *torch.Tensor, adapter *FeedForwardLoRA, alpha float64) (*torch.Tensor, error) {
 	if x == nil || gateWeight == nil || upWeight == nil || downWeight == nil {
 		return nil, errors.New("layers: promoted feed-forward requires input and weights")
 	}
@@ -231,13 +237,17 @@ func FeedForwardPromoted(x, gateWeight, upWeight, downWeight *torch.Tensor) (*to
 		}
 		return s.run(func() (*torch.Tensor, error) { return value.To(xInfo.Device, torch.Float32) })
 	}
+	var pairs FeedForwardLoRA
+	if adapter != nil {
+		pairs = *adapter
+	}
 	input := s.run(func() (*torch.Tensor, error) { return x.To(xInfo.Device, torch.Float32) })
 	gateBase, upBase, downBase := promote(gateWeight), promote(upWeight), promote(downWeight)
-	gate := s.run(func() (*torch.Tensor, error) { return Linear(input, gateBase) })
+	gate := s.run(func() (*torch.Tensor, error) { return project(input, gateBase, pairs.GateA, pairs.GateB, alpha) })
 	gate = s.run(func() (*torch.Tensor, error) { return gate.SiLU() })
-	up := s.run(func() (*torch.Tensor, error) { return Linear(input, upBase) })
+	up := s.run(func() (*torch.Tensor, error) { return project(input, upBase, pairs.UpA, pairs.UpB, alpha) })
 	product := s.run(func() (*torch.Tensor, error) { return gate.Mul(up) })
-	result := s.run(func() (*torch.Tensor, error) { return Linear(product, downBase) })
+	result := s.run(func() (*torch.Tensor, error) { return project(product, downBase, pairs.DownA, pairs.DownB, alpha) })
 	return s.result(result)
 }
 

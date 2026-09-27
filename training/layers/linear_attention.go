@@ -48,14 +48,34 @@ type linearAttentionGeometry struct {
 // x is [B,T,D]; all arguments are borrowed and immutable. The caller owns the
 // detached result. This block has no LoRA weights and no model-training claim.
 func ForwardLinearAttention(ctx context.Context, x *torch.Tensor, weights LinearAttentionWeights, config LinearAttentionConfig) (*torch.Tensor, error) {
-	geometry, config, err := validateLinearAttention(ctx, x, weights, nil, config)
+	return forwardLinearAttention(ctx, x, weights, linearPairs{}, config)
+}
+
+// linearPairs carries a recurrent block's optional adapter and its scale.
+// The zero value is the frozen block.
+type linearPairs struct {
+	lora  LinearAttentionLoRA
+	alpha float64
+}
+
+// projection returns the block's pair for a recurrent target.
+func (p linearPairs) projection(target LoRATarget) (a, b *torch.Tensor) {
+	if !target.LinearAttention() {
+		return nil, nil
+	}
+	x, y := pairOf(target, [4][2]**torch.Tensor{}, &p.lora, &FeedForwardLoRA{})
+	return *x, *y
+}
+
+func forwardLinearAttention(ctx context.Context, x *torch.Tensor, weights LinearAttentionWeights, pairs linearPairs, config LinearAttentionConfig) (*torch.Tensor, error) {
+	geometry, config, err := validateLinearAttention(ctx, x, weights, pairs, nil, config)
 	if err != nil {
 		return nil, err
 	}
 	s := linearAttentionScope{ctx: ctx}
 	defer s.close()
 	input := s.run(func() (*torch.Tensor, error) { return x.Detach() })
-	recurrence, gate := projectLinearAttention(&s, input, weights, geometry, config)
+	recurrence, gate := projectLinearAttention(&s, input, weights, pairs, geometry, config)
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -64,7 +84,7 @@ func ForwardLinearAttention(ctx context.Context, x *torch.Tensor, weights Linear
 		return nil, err
 	}
 	defer output.Close()
-	result := finishLinearAttention(&s, output.Values, gate, weights, geometry, config)
+	result := finishLinearAttention(&s, output.Values, gate, weights, pairs, geometry, config)
 	result = s.run(func() (*torch.Tensor, error) { return result.Detach() })
 	return s.result(result)
 }
@@ -76,66 +96,124 @@ func ForwardLinearAttention(ctx context.Context, x *torch.Tensor, weights Linear
 // is checked between native operations; an already-running kernel cannot be
 // preempted through this API.
 func LinearAttentionVJP(ctx context.Context, x *torch.Tensor, weights LinearAttentionWeights, dy *torch.Tensor, config LinearAttentionConfig) (*torch.Tensor, error) {
+	input, _, err := linearAttentionVJP(ctx, x, weights, linearPairs{}, dy, config)
+	return input, err
+}
+
+// linearAttentionVJP also returns the cotangent of every adapted pair, laid
+// out like the adapter. The caller owns every returned handle.
+func linearAttentionVJP(ctx context.Context, x *torch.Tensor, weights LinearAttentionWeights, pairs linearPairs, dy *torch.Tensor, config LinearAttentionConfig) (*torch.Tensor, LinearAttentionLoRA, error) {
+	var adapted LinearAttentionLoRA
 	if dy == nil {
-		return nil, errors.New("layers: linear attention VJP requires a cotangent")
+		return nil, adapted, errors.New("layers: linear attention VJP requires a cotangent")
 	}
-	geometry, config, err := validateLinearAttention(ctx, x, weights, dy, config)
+	geometry, config, err := validateLinearAttention(ctx, x, weights, pairs, dy, config)
 	if err != nil {
-		return nil, err
+		return nil, adapted, err
 	}
 	s := linearAttentionScope{ctx: ctx}
 	defer s.close()
 	input := s.run(func() (*torch.Tensor, error) { return x.Detach() })
 	input = s.run(func() (*torch.Tensor, error) { return input.SetRequiresGrad(true) })
-	recurrence, gate := projectLinearAttention(&s, input, weights, geometry, config)
+	recurrence, gate := projectLinearAttention(&s, input, weights, pairs, geometry, config)
 	if s.err != nil {
-		return nil, s.err
+		return nil, adapted, s.err
 	}
 	forward, err := sequence.Forward(ctx, recurrence, config.Sequence)
 	if err != nil {
-		return nil, err
+		return nil, adapted, err
 	}
 	defer forward.Close()
 	outerScope := linearAttentionScope{ctx: ctx}
 	defer outerScope.close()
 	core := outerScope.run(func() (*torch.Tensor, error) { return forward.Values.Detach() })
 	core = outerScope.run(func() (*torch.Tensor, error) { return core.SetRequiresGrad(true) })
-	result := finishLinearAttention(&outerScope, core, gate, weights, geometry, config)
+	result := finishLinearAttention(&outerScope, core, gate, weights, pairs, geometry, config)
 	// The Z/gate branch and recurrence projections share only the input leaf.
 	// Release the output graph after its VJP; the projection graph remains
-	// available for the recurrence cotangents below.
-	outer := outerScope.grad([]*torch.Tensor{result}, []*torch.Tensor{core, input}, []*torch.Tensor{dy}, false)
+	// available for the recurrence cotangents below. The Z and output pairs
+	// reach the result only through this graph; the others only through the
+	// recurrence.
+	outerTargets := pairs.present(LoRALinearOutput, LoRALinearZ)
+	outer := outerScope.grad([]*torch.Tensor{result}, pairs.inputs([]*torch.Tensor{core, input}, outerTargets), []*torch.Tensor{dy}, false)
 	if outerScope.err != nil {
-		return nil, outerScope.err
+		return nil, adapted, outerScope.err
 	}
 	for _, gradient := range outer {
 		owned, err := outerScope.scope.result(gradient)
 		if err != nil {
-			return nil, err
+			return nil, adapted, err
 		}
 		s.tensors = append(s.tensors, owned)
 	}
-	// Keep only the two cotangents. In particular, core aliases must close
+	// Keep only the cotangents. In particular, core aliases must close
 	// before the first forward's Values storage can be released.
 	outerScope.close()
 	_ = forward.Close()
 	backward, err := sequence.GradVJP(ctx, recurrence, outer[0], recurrence.InitialState, config.Sequence)
 	if err != nil {
-		return nil, err
+		return nil, adapted, err
 	}
 	defer backward.Close()
 	// This caller consumes only adjoints, not the recomputed forward result.
 	_ = backward.Output.Close()
 	g := backward.Gradients
+	innerTargets := pairs.present(LoRALinearQKV, LoRALinearBeta, LoRALinearAlpha)
 	inner := s.grad(
 		[]*torch.Tensor{recurrence.Query, recurrence.Key, recurrence.Value, recurrence.LogDecay, recurrence.Beta},
-		[]*torch.Tensor{input}, []*torch.Tensor{g.Query, g.Key, g.Value, g.LogDecay, g.Beta}, false)
+		pairs.inputs([]*torch.Tensor{input}, innerTargets), []*torch.Tensor{g.Query, g.Key, g.Value, g.LogDecay, g.Beta}, false)
 	if s.err != nil {
-		return nil, s.err
+		return nil, adapted, s.err
 	}
 	result = s.run(func() (*torch.Tensor, error) { return inner[0].Add(outer[1]) })
 	result = s.run(func() (*torch.Tensor, error) { return result.Detach() })
-	return s.result(result)
+	if s.err != nil {
+		return nil, adapted, s.err
+	}
+	// Pair cotangents leave the scope first; the input result then performs
+	// the final cancellation check, and a failure there releases them again.
+	for _, group := range []struct {
+		targets   []LoRATarget
+		gradients []*torch.Tensor
+	}{{outerTargets, outer[2:]}, {innerTargets, inner[1:]}} {
+		for i, target := range group.targets {
+			a, b := pairOf(target, [4][2]**torch.Tensor{}, &adapted, &FeedForwardLoRA{})
+			*a, _ = s.scope.result(group.gradients[2*i])
+			*b, _ = s.scope.result(group.gradients[2*i+1])
+		}
+	}
+	inputGradient, err := s.result(result)
+	if err != nil {
+		for _, target := range LoRATargets() {
+			if target.LinearAttention() {
+				a, b := pairOf(target, [4][2]**torch.Tensor{}, &adapted, &FeedForwardLoRA{})
+				_, _ = (*a).Close(), (*b).Close()
+			}
+		}
+		return nil, LinearAttentionLoRA{}, err
+	}
+	return inputGradient, adapted, nil
+}
+
+// present lists the given targets this block adapts, in the given order.
+func (p linearPairs) present(targets ...LoRATarget) []LoRATarget {
+	var result []LoRATarget
+	for _, target := range targets {
+		if a, _ := p.projection(target); a != nil {
+			result = append(result, target)
+		}
+	}
+	return result
+}
+
+// inputs appends the A and B leaves of targets to the differentiated inputs.
+func (p linearPairs) inputs(leading []*torch.Tensor, targets []LoRATarget) []*torch.Tensor {
+	result := append([]*torch.Tensor(nil), leading...)
+	for _, target := range targets {
+		a, b := p.projection(target)
+		result = append(result, a, b)
+	}
+	return result
 }
 
 // Every intermediate is checked, including pre-normalization squares and
@@ -212,7 +290,7 @@ func (s *linearAttentionScope) result(value *torch.Tensor) (*torch.Tensor, error
 	return s.scope.result(value)
 }
 
-func validateLinearAttention(ctx context.Context, x *torch.Tensor, weights LinearAttentionWeights, dy *torch.Tensor, config LinearAttentionConfig) (linearAttentionGeometry, LinearAttentionConfig, error) {
+func validateLinearAttention(ctx context.Context, x *torch.Tensor, weights LinearAttentionWeights, pairs linearPairs, dy *torch.Tensor, config LinearAttentionConfig) (linearAttentionGeometry, LinearAttentionConfig, error) {
 	var geometry linearAttentionGeometry
 	fail := func(message string) (linearAttentionGeometry, LinearAttentionConfig, error) {
 		return geometry, config, errors.New("layers: " + message)
@@ -331,6 +409,37 @@ func validateLinearAttention(ctx context.Context, x *torch.Tensor, weights Linea
 			}
 		}
 	}
+	// Adapted pairs change every step, so their values are left to the
+	// finite checks of every intermediate; only their geometry is admitted.
+	projections := map[LoRATarget][2]int64{
+		LoRALinearOutput: {geometry.hidden, geometry.values}, LoRALinearQKV: {geometry.channels, geometry.hidden},
+		LoRALinearZ: {geometry.values, geometry.hidden}, LoRALinearBeta: {config.ValueHeads, geometry.hidden}, LoRALinearAlpha: {config.ValueHeads, geometry.hidden},
+	}
+	for _, target := range LoRATargets() {
+		if !target.LinearAttention() {
+			continue
+		}
+		a, b := pairs.projection(target)
+		if a == nil && b == nil {
+			continue
+		}
+		if a == nil || b == nil || !positiveFinite(pairs.alpha) {
+			return fail("linear-attention LoRA requires both A and B and a finite positive alpha")
+		}
+		aInfo, err := a.Info()
+		if err != nil {
+			return geometry, config, err
+		}
+		bInfo, err := b.Info()
+		if err != nil {
+			return geometry, config, err
+		}
+		shape := projections[target]
+		if len(aInfo.Shape) != 2 || len(bInfo.Shape) != 2 || aInfo.Shape[0] <= 0 || aInfo.Shape[1] != shape[1] || !equalShape(bInfo.Shape, []int64{shape[0], aInfo.Shape[0]}) ||
+			aInfo.DType != torch.Float32 || bInfo.DType != torch.Float32 || aInfo.Device != geometry.device || bInfo.Device != geometry.device {
+			return fail("invalid linear-attention LoRA shape, dtype or device")
+		}
+	}
 	return geometry, config, ctx.Err()
 }
 
@@ -349,8 +458,14 @@ func linearAttentionProduct(dimensions ...int64) (int64, error) {
 	return product, nil
 }
 
-func projectLinearAttention(s *linearAttentionScope, x *torch.Tensor, weights LinearAttentionWeights, geometry linearAttentionGeometry, config LinearAttentionConfig) (tensor.Input, *torch.Tensor) {
-	mixed := s.runNamed("qkv_projection", func() (*torch.Tensor, error) { return Linear(x, weights.QKV) })
+func projectLinearAttention(s *linearAttentionScope, x *torch.Tensor, weights LinearAttentionWeights, pairs linearPairs, geometry linearAttentionGeometry, config LinearAttentionConfig) (tensor.Input, *torch.Tensor) {
+	adapted := func(input, weight *torch.Tensor, target LoRATarget) func() (*torch.Tensor, error) {
+		return func() (*torch.Tensor, error) {
+			a, b := pairs.projection(target)
+			return project(input, weight, a, b, pairs.alpha)
+		}
+	}
+	mixed := s.runNamed("qkv_projection", adapted(x, weights.QKV, LoRALinearQKV))
 	var convolution *torch.Tensor
 	for tap := int64(0); tap < 4 && s.check(); tap++ {
 		lag := 3 - tap
@@ -424,15 +539,15 @@ func projectLinearAttention(s *linearAttentionScope, x *torch.Tensor, weights Li
 		key = s.runNamed("key_head_repeat", func() (*torch.Tensor, error) { return key.IndexSelect(2, indices) })
 	}
 	query = s.runNamed("query_scale", func() (*torch.Tensor, error) { return query.Scale(1 / math.Sqrt(float64(config.KeyDimension))) })
-	beta := s.runNamed("beta_projection", func() (*torch.Tensor, error) { return Linear(x, weights.Beta) })
+	beta := s.runNamed("beta_projection", adapted(x, weights.Beta, LoRALinearBeta))
 	beta = s.runNamed("beta_sigmoid", func() (*torch.Tensor, error) { return beta.Sigmoid() })
-	decay := s.runNamed("decay_projection", func() (*torch.Tensor, error) { return Linear(x, weights.Alpha) })
+	decay := s.runNamed("decay_projection", adapted(x, weights.Alpha, LoRALinearAlpha))
 	decay = s.runNamed("decay_bias", func() (*torch.Tensor, error) { return decay.Add(weights.DTBias) })
 	decay = s.runNamed("decay_softplus", func() (*torch.Tensor, error) { return decay.Softplus() })
 	negativeA := s.runNamed("negative_a_exp", func() (*torch.Tensor, error) { return weights.ALog.Exp() })
 	negativeA = s.runNamed("negative_a_scale", func() (*torch.Tensor, error) { return negativeA.Scale(-1) })
 	decay = s.runNamed("decay_log", func() (*torch.Tensor, error) { return decay.Mul(negativeA) })
-	gate := s.runNamed("gate_projection", func() (*torch.Tensor, error) { return Linear(x, weights.Z) })
+	gate := s.runNamed("gate_projection", adapted(x, weights.Z, LoRALinearZ))
 	gate = s.runNamed("gate_reshape", func() (*torch.Tensor, error) {
 		return gate.Reshape([]int64{geometry.batch, geometry.tokens, config.ValueHeads, config.ValueDimension})
 	})
@@ -442,10 +557,13 @@ func projectLinearAttention(s *linearAttentionScope, x *torch.Tensor, weights Li
 	return tensor.Input{Query: query, Key: key, Value: value, LogDecay: decay, Beta: beta, InitialState: initial}, gate
 }
 
-func finishLinearAttention(s *linearAttentionScope, core, gate *torch.Tensor, weights LinearAttentionWeights, geometry linearAttentionGeometry, config LinearAttentionConfig) *torch.Tensor {
+func finishLinearAttention(s *linearAttentionScope, core, gate *torch.Tensor, weights LinearAttentionWeights, pairs linearPairs, geometry linearAttentionGeometry, config LinearAttentionConfig) *torch.Tensor {
 	value := s.runNamed("gated_rms_norm", func() (*torch.Tensor, error) { return GatedRMSNorm(core, weights.Norm, gate, config.Epsilon) })
 	value = s.runNamed("output_reshape", func() (*torch.Tensor, error) {
 		return value.Reshape([]int64{geometry.batch, geometry.tokens, geometry.values})
 	})
-	return s.runNamed("output_projection", func() (*torch.Tensor, error) { return Linear(value, weights.Output) })
+	return s.runNamed("output_projection", func() (*torch.Tensor, error) {
+		a, b := pairs.projection(LoRALinearOutput)
+		return project(value, weights.Output, a, b, pairs.alpha)
+	})
 }

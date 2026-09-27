@@ -8,7 +8,7 @@ import (
 )
 
 // DecoderWeights describes one frozen hybrid decoder decoder. Exactly one attention
-// variant is supplied. LoRA belongs only to a full-attention variant.
+// variant is supplied. Its adapter may carry pairs of that variant and the MLP.
 type DecoderWeights struct {
 	InputNorm, PostAttentionNorm, Gate, Up, Down *torch.Tensor
 	Full                                         *AttentionWeights
@@ -23,10 +23,15 @@ type DecoderConfig struct {
 	Linear           LinearAttentionConfig
 }
 
-// DecoderGradients owns the input cotangent and, for a full-attention block with
-// LoRA, its four parameter cotangents. The base weights are never updated.
+// DecoderGradients owns the input cotangent and the cotangent of every
+// adapted pair, laid out like the adapter: Query/Value/Key/Output for full
+// attention, Linear for a recurrent block and FeedForward for the MLP.
+// Unadapted pairs stay nil. The base weights are never updated.
 type DecoderGradients struct {
 	Input, QueryA, QueryB, ValueA, ValueB *torch.Tensor
+	KeyA, KeyB, OutputA, OutputB          *torch.Tensor
+	Linear                                LinearAttentionLoRA
+	FeedForward                           FeedForwardLoRA
 }
 
 // Close releases all owned gradient handles.
@@ -34,7 +39,12 @@ func (g *DecoderGradients) Close() error {
 	if g == nil {
 		return nil
 	}
-	return errors.Join(g.Input.Close(), g.QueryA.Close(), g.QueryB.Close(), g.ValueA.Close(), g.ValueB.Close())
+	failures := []error{g.Input.Close()}
+	for _, target := range LoRATargets() {
+		a, b := g.Pair(target)
+		failures = append(failures, (*a).Close(), (*b).Close())
+	}
+	return errors.Join(failures...)
 }
 
 // DecoderForward computes a complete decoder block and returns detached output.
@@ -58,8 +68,10 @@ func DecoderForward(ctx context.Context, x *torch.Tensor, weights DecoderWeights
 
 // DecoderVJP recomputes one decoder block and propagates the complete input
 // gradient through both residual and attention paths. Recurrent attention uses
-// explicit state VJPs; it is not treated as a stop-gradient layer. Inputs and
-// parameters remain caller-owned and are not changed.
+// explicit state VJPs; it is not treated as a stop-gradient layer. Adapted
+// pairs of full attention and the MLP are differentiated through the block
+// graph, and recurrent pairs through the same explicit VJP as the input.
+// Inputs and parameters remain caller-owned and are not changed.
 func DecoderVJP(ctx context.Context, x *torch.Tensor, weights DecoderWeights, adapter *AttentionLoRA, cosine, sine, cotangent *torch.Tensor, config DecoderConfig) (*DecoderGradients, error) {
 	if err := decoderValidate(ctx, x, weights, adapter, config); err != nil {
 		return nil, err
@@ -93,8 +105,16 @@ func DecoderVJP(ctx context.Context, x *torch.Tensor, weights DecoderWeights, ad
 	inputs := []*torch.Tensor{input}
 	if weights.Linear != nil {
 		inputs = append(inputs, attentionOutput)
-	} else if adapter != nil {
-		inputs = append(inputs, adapter.QueryA, adapter.QueryB, adapter.ValueA, adapter.ValueB)
+	}
+	// Full-attention and MLP pairs live in this graph; recurrent pairs are
+	// reached only through the explicit VJP below.
+	var graphTargets []LoRATarget
+	for _, target := range adapter.Targets() {
+		if !target.LinearAttention() {
+			a, b := adapter.Pair(target)
+			graphTargets = append(graphTargets, target)
+			inputs = append(inputs, *a, *b)
+		}
 	}
 	// Recurrent attentionOutput is a detached leaf. The residual/MLP graph
 	// shares only input with the separate input-normalization graph, so its
@@ -107,42 +127,63 @@ func DecoderVJP(ctx context.Context, x *torch.Tensor, weights DecoderWeights, ad
 		s.tensors = append(s.tensors, gradient)
 	}
 	inputGradient := gradients[0]
+	pairGradients := gradients[1:]
+	result := &DecoderGradients{}
 	if weights.Linear != nil {
-		attentionGradient := s.run(func() (*torch.Tensor, error) {
-			return LinearAttentionVJP(ctx, attentionInput, *weights.Linear, gradients[1], config.Linear)
-		})
-		if s.err != nil {
-			return nil, s.err
+		pairGradients = gradients[2:]
+		var pairs linearPairs
+		if adapter != nil {
+			pairs = linearPairs{lora: adapter.Linear, alpha: adapter.Alpha}
 		}
+		attentionGradient, adapted, err := linearAttentionVJP(ctx, attentionInput, *weights.Linear, pairs, gradients[1], config.Linear)
+		// Take ownership of every returned handle before any later failure.
+		result.Linear = adapted
+		if err != nil {
+			_ = result.Close()
+			return nil, err
+		}
+		s.tensors = append(s.tensors, attentionGradient)
 		throughNormalization, err := torch.Grad([]*torch.Tensor{attentionInput}, []*torch.Tensor{input}, []*torch.Tensor{attentionGradient}, false, false)
 		if err != nil {
+			_ = result.Close()
 			return nil, err
 		}
 		s.tensors = append(s.tensors, throughNormalization...)
 		inputGradient = s.run(func() (*torch.Tensor, error) { return inputGradient.Add(throughNormalization[0]) })
 	}
 	if s.err != nil {
+		_ = result.Close()
 		return nil, s.err
 	}
-	result := &DecoderGradients{}
 	result.Input, err = s.result(inputGradient)
 	if err != nil {
+		_ = result.Close()
 		return nil, err
 	}
-	if adapter != nil {
-		result.QueryA, _ = s.result(gradients[1])
-		result.QueryB, _ = s.result(gradients[2])
-		result.ValueA, _ = s.result(gradients[3])
-		result.ValueB, _ = s.result(gradients[4])
+	for i, target := range graphTargets {
+		a, b := result.Pair(target)
+		*a, _ = s.result(pairGradients[2*i])
+		*b, _ = s.result(pairGradients[2*i+1])
 	}
-	for _, gradient := range []*torch.Tensor{result.Input, result.QueryA, result.QueryB, result.ValueA, result.ValueB} {
-		if gradient == nil {
-			continue
-		}
+	for _, gradient := range []*torch.Tensor{result.Input} {
 		finite, err := gradient.AllFinite()
 		if err != nil || !finite {
 			_ = result.Close()
 			return nil, errors.Join(errors.New("layers: non-finite decoder gradient"), err)
+		}
+	}
+	for _, target := range adapter.Targets() {
+		a, b := result.Pair(target)
+		for _, gradient := range []*torch.Tensor{*a, *b} {
+			if gradient == nil {
+				_ = result.Close()
+				return nil, errors.New("layers: missing decoder adapter gradient")
+			}
+			finite, err := gradient.AllFinite()
+			if err != nil || !finite {
+				_ = result.Close()
+				return nil, errors.Join(errors.New("layers: non-finite decoder gradient"), err)
+			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -158,6 +199,13 @@ func decoderGraph(ctx context.Context, s *scope, input *torch.Tensor, weights De
 		s.err = err
 		return nil, nil, nil
 	}
+	var linear linearPairs
+	var feedForward *FeedForwardLoRA
+	alpha := 0.0
+	if adapter != nil {
+		linear = linearPairs{lora: adapter.Linear, alpha: adapter.Alpha}
+		feedForward, alpha = &adapter.FeedForward, adapter.Alpha
+	}
 	// Attention is admitted in Float32. Promote before RMSNorm so a finite
 	// normalized activation is never rounded through Float16 and turned into
 	// an infinity before entering either attention implementation. The
@@ -171,7 +219,7 @@ func decoderGraph(ctx context.Context, s *scope, input *torch.Tensor, weights De
 		})
 	} else {
 		attentionOutput = s.run(func() (*torch.Tensor, error) {
-			return ForwardLinearAttention(ctx, attentionInput, *weights.Linear, config.Linear)
+			return forwardLinearAttention(ctx, attentionInput, *weights.Linear, linear, config.Linear)
 		})
 		if backward {
 			attentionOutput = s.run(func() (*torch.Tensor, error) { return attentionOutput.SetRequiresGrad(true) })
@@ -180,10 +228,10 @@ func decoderGraph(ctx context.Context, s *scope, input *torch.Tensor, weights De
 	attentionStorage := s.run(func() (*torch.Tensor, error) { return attentionOutput.To(info.Device, info.DType) })
 	residual := s.run(func() (*torch.Tensor, error) { return input.Add(attentionStorage) })
 	normalized = s.run(func() (*torch.Tensor, error) { return RMSNorm(residual, weights.PostAttentionNorm, config.Epsilon) })
-	feedForward := s.run(func() (*torch.Tensor, error) {
-		return FeedForwardPromoted(normalized, weights.Gate, weights.Up, weights.Down)
+	feedForwardOutput := s.run(func() (*torch.Tensor, error) {
+		return feedForwardPromoted(normalized, weights.Gate, weights.Up, weights.Down, feedForward, alpha)
 	})
-	feedForwardStorage := s.run(func() (*torch.Tensor, error) { return feedForward.To(info.Device, info.DType) })
+	feedForwardStorage := s.run(func() (*torch.Tensor, error) { return feedForwardOutput.To(info.Device, info.DType) })
 	output = s.run(func() (*torch.Tensor, error) { return residual.Add(feedForwardStorage) })
 	return output, attentionInput, attentionOutput
 }
@@ -203,8 +251,13 @@ func decoderValidate(ctx context.Context, x *torch.Tensor, weights DecoderWeight
 		(info.DType != torch.Float16 && info.DType != torch.Float32) || !positiveFinite(config.Epsilon) {
 		return errors.New("layers: decoder input geometry, precision or budget is invalid")
 	}
-	if (weights.Full == nil) == (weights.Linear == nil) || (weights.Linear != nil && adapter != nil) {
-		return errors.New("layers: decoder requires exactly one attention variant; LoRA is full-attention only")
+	if (weights.Full == nil) == (weights.Linear == nil) {
+		return errors.New("layers: decoder requires exactly one attention variant")
+	}
+	if adapter != nil {
+		if err := adapter.validate(weights.Full != nil, info.Device); err != nil {
+			return err
+		}
 	}
 	for _, weight := range []*torch.Tensor{weights.InputNorm, weights.PostAttentionNorm, weights.Gate, weights.Up, weights.Down} {
 		if weight == nil {

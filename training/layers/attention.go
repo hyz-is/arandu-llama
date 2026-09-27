@@ -14,11 +14,18 @@ type AttentionWeights struct {
 	QueryNorm, KeyNorm        *torch.Tensor
 }
 
-// AttentionLoRA supplies the only trainable projections in the full-attention
-// block. A nil adapter means a base-only forward, not a training qualification.
+// AttentionLoRA supplies every trainable pair of one decoder block: the
+// full-attention projections directly, a recurrent block's projections in
+// Linear and the MLP in FeedForward. Query and Value alone are the q/v
+// adapter. A nil pair leaves its projection frozen, one nil tensor of a pair
+// is refused, and every pair is scaled by Alpha/rank with rank from its A. A
+// nil adapter means a base-only forward, not a training qualification.
 type AttentionLoRA struct {
 	QueryA, QueryB, ValueA, ValueB *torch.Tensor
 	Alpha                          float64
+	KeyA, KeyB, OutputA, OutputB   *torch.Tensor
+	Linear                         LinearAttentionLoRA
+	FeedForward                    FeedForwardLoRA
 }
 
 // AttentionConfig describes grouped query attention and its explicit budget.
@@ -88,19 +95,16 @@ func FullAttention(x *torch.Tensor, weights AttentionWeights, adapter *Attention
 	}
 	var s scope
 	defer s.close()
-	var query, value *torch.Tensor
-	if adapter == nil {
-		query = s.run(func() (*torch.Tensor, error) { return Linear(x, weights.Query) })
-		value = s.run(func() (*torch.Tensor, error) { return Linear(x, weights.Value) })
-	} else {
-		query = s.run(func() (*torch.Tensor, error) {
-			return LoRALinear(x, weights.Query, adapter.QueryA, adapter.QueryB, adapter.Alpha)
-		})
-		value = s.run(func() (*torch.Tensor, error) {
-			return LoRALinear(x, weights.Value, adapter.ValueA, adapter.ValueB, adapter.Alpha)
-		})
+	projection := func(input, weight *torch.Tensor, target LoRATarget) *torch.Tensor {
+		if adapter == nil {
+			return s.run(func() (*torch.Tensor, error) { return Linear(input, weight) })
+		}
+		a, b := adapter.Pair(target)
+		return s.run(func() (*torch.Tensor, error) { return project(input, weight, *a, *b, adapter.Alpha) })
 	}
-	key := s.run(func() (*torch.Tensor, error) { return Linear(x, weights.Key) })
+	query := projection(x, weights.Query, LoRAQuery)
+	value := projection(x, weights.Value, LoRAValue)
+	key := projection(x, weights.Key, LoRAKey)
 	query = s.run(func() (*torch.Tensor, error) {
 		return query.Reshape([]int64{batch, tokens, config.Heads, 2 * config.HeadDimension})
 	})
@@ -149,7 +153,7 @@ func FullAttention(x *torch.Tensor, weights AttentionWeights, adapter *Attention
 	result = s.run(func() (*torch.Tensor, error) {
 		return result.Reshape([]int64{batch, tokens, config.Heads * config.HeadDimension})
 	})
-	result = s.run(func() (*torch.Tensor, error) { return Linear(result, weights.Output) })
+	result = projection(result, weights.Output, LoRAOutput)
 	return s.result(result)
 }
 

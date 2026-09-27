@@ -98,19 +98,28 @@ func doubles(values []float32) []float64 {
 // oracle uses only scalar Go float64 loops. It deliberately does not call
 // layers, sequence, tensor, or the pure-Go GDN implementation under test.
 func (f fixture) oracle(x []float64) []float64 {
+	return f.oracleWith(x, projections{qkv: doubles(f.qkv), z: doubles(f.z), alpha: doubles(f.alpha), beta: doubles(f.beta), out: doubles(f.out)})
+}
+
+// projections holds the five projection matrices in float64, so an adapted
+// oracle can merge its pairs into them without rounding.
+type projections struct{ qkv, z, alpha, beta, out []float64 }
+
+// oracleWith is the oracle over explicit projection matrices.
+func (f fixture) oracleWith(x []float64, w projections) []float64 {
 	channels, keys, values := 2*f.kh*f.kd+f.vh*f.vd, f.kh*f.kd, f.vh*f.vd
-	project := func(weights []float32, size int) []float64 {
+	project := func(weights []float64, size int) []float64 {
 		result := make([]float64, f.batch*f.tokens*size)
 		for row := 0; row < f.batch*f.tokens; row++ {
 			for output := 0; output < size; output++ {
 				for input := 0; input < f.hidden; input++ {
-					result[row*size+output] += x[row*f.hidden+input] * float64(weights[output*f.hidden+input])
+					result[row*size+output] += x[row*f.hidden+input] * weights[output*f.hidden+input]
 				}
 			}
 		}
 		return result
 	}
-	mixed, z, a, beta := project(f.qkv, channels), project(f.z, values), project(f.alpha, f.vh), project(f.beta, f.vh)
+	mixed, z, a, beta := project(w.qkv, channels), project(w.z, values), project(w.alpha, f.vh), project(w.beta, f.vh)
 	conv := make([]float64, len(mixed))
 	for b := 0; b < f.batch; b++ {
 		for token := 0; token < f.tokens; token++ {
@@ -181,7 +190,7 @@ func (f fixture) oracle(x []float64) []float64 {
 	for row := 0; row < f.batch*f.tokens; row++ {
 		for out := 0; out < f.hidden; out++ {
 			for in := 0; in < values; in++ {
-				result[row*f.hidden+out] += core[row*values+in] * float64(f.out[out*values+in])
+				result[row*f.hidden+out] += core[row*values+in] * w.out[out*values+in]
 			}
 		}
 	}
