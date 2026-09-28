@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Chat prompts change for templates the legacy formatter read as a known format:
+they are now the model's own Jinja template, which may add a reasoning system
+turn or a `<think>` block. Anything that stores prompt boundaries or token
+counts produced through `FormatChatPrompt` must be regenerated after upgrading,
+and should record `ChatTemplateEngine` beside the template digest. Pass
+`EnableThinking` explicitly when the thinking default matters.
+
 Model identities now belong to private installation configuration. Construct
 `NewMXCatalog` from typed `MXModelIdentity` entries and pass the selected identity
 in `MXConfig.Model`. Repository, revision, manifest, quantisation and shard

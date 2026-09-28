@@ -501,10 +501,10 @@ func (c *Context) GenerateWithDraftChannel(ctx gocontext.Context, prompt string,
 
 // Chat performs conversational generation using chat messages.
 //
-// This method formats messages using a chat template and generates a response.
-// The template can be provided in opts or will be read from the model's GGUF
-// metadata. Supports 40+ template formats including ChatML, Llama-2, Llama-3,
-// Mistral, Gemma, and Phi-3.
+// This method renders messages with a Jinja chat template and generates a
+// response. The template is the one in opts or, by default, the model's own
+// GGUF template, rendered by llama.cpp's Jinja engine; a template that does not
+// render is an error, never replaced by a guessed format.
 //
 // See also: ChatStream for streaming responses, Generate for raw prompt completion.
 //

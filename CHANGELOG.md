@@ -10,7 +10,21 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+### Added
+
+- `RenderChatTemplate` renders a conversation with a Jinja chat template without
+  loading a model, and `ChatTemplateEngine` names the formatter a prompt came
+  from.
+- `decoder.CompletionLoss` and `local.MeasureLosses` read the completion loss
+  of existing checkpoints without computing a gradient.
+
 ### Changed
+
+- Chat prompts are rendered with the model's own GGUF template through
+  llama.cpp's Jinja engine for every family. The heuristic legacy formatter is
+  gone and nothing falls back to it: a template that does not render is an
+  error. `EnableThinking` and `ChatTemplateKwargs` now reach the template, and
+  thinking follows the llama-server default when unset.
 
 - Training uses architecture and role contracts, with installation-owned model
   identities and recipes supplied explicitly. Existing calculations and artifact
