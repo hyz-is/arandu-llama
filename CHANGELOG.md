@@ -82,6 +82,21 @@ a release is corrected by another release and never by moving a tag.
   The loss is the mean per completion token; `lossScale` scales only the
   cotangent. `decoder.CompletionTokenLogProbabilities` reads the student's
   log-softmax at every completion token.
+- `Context.SampleRollout` samples a continuation of a tokenised prompt from an
+  empty KV cache. For every token it returns the id and log mu: the float64
+  log probability under the distribution the token was actually drawn from,
+  filters included.
+  - `RolloutOptions` requires temperature, top-k, top-p, min-p, seed and a
+    token ceiling. Nothing is defaulted.
+  - The temperature is applied before the filters, and top-p reads the
+    renormalised top-k set.
+  - The end-of-generation token is kept, `Rollout.Stop` names why the rollout
+    ended, and a failed decode is an error.
+  - A rollout is labelled with the adapter digests and scales, the
+    quantisation, the KV cache type and `RolloutVersion`.
+
+  `DrawFromLogits` and `RolloutUniforms` run the same arithmetic on a supplied
+  logit row.
 
 ### Fixed
 

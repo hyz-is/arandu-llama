@@ -17,10 +17,13 @@ return text: a parse failure, a decode failure or a cancelled context is an
 error. Check `FinishReason` before treating `Content` as an answer; with
 `FinishReasonLength` it may be empty. `ReasoningFormatNone` is unchanged.
 
-Rebuild `libbinding.a` after upgrading. The internal C signatures of the chat
-render, the reasoning parse and the generation parameters changed under
-unchanged symbol names. An archive built before this release links against
-the new Go code without error and receives misplaced arguments.
+The internal C signatures of the chat render, the reasoning parse and the
+generation parameters changed under unchanged symbol names. cgo compiles
+`wrapper.cpp`, `wrapper_adapter.cpp` and `wrapper_rollout.cpp` with the package,
+so those symbols always come from the sources being built. The copies in
+`libbinding.a` are not what the Go link resolves them to. Rebuild `libbinding.a`
+with `make` so it carries the new object, as the Makefile does, and so the
+llama.cpp libraries beside it match the pinned commit.
 
 Existing recipes, mappings and caches do not change. To distil:
 1. Measure both tokenizers.
