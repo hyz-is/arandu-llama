@@ -110,6 +110,26 @@ a release is corrected by another release and never by moving a tag.
   refused. The serializable `Decision` carries the order, each round's
   standings, the factors, the softmax weights and the configuration and input
   digests. No entry point accepts a teacher output.
+- `fusioncache.CapabilityPackage` (schema 1) is the immutable provenance of one
+  admitted training unit. It records:
+  - the capability, the example and the digest of its rendered context;
+  - the versioned verifier and its verdict;
+  - the consulted teachers, each with its pinned model, license, score, weight
+    and verified outcome;
+  - the admitted signal and its position mask;
+  - a lineage snapshot and the Protection cohort;
+  - an optional router decision;
+  - an index of every cited artifact.
+
+  `EncodePackage` gives a canonical encoding whose SHA-256 is the package
+  digest. `ValidatePackage` and `DecodePackage` refuse incomplete, ambiguous or
+  incoherent packages, including duplicate, case-folded and unknown JSON keys.
+  `Supersede` makes the next revision.
+- `fusioncache.PackageStore` freezes packages under their digest with an
+  atomic install that never replaces a file. A correction requires its
+  predecessor in the store, and a package can be corrected only once.
+  `History`, `Successor`, `FreezeManifest` and `ReadManifest` read the chain
+  back.
 
 ### Fixed
 
