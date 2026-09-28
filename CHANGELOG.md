@@ -59,6 +59,15 @@ a release is corrected by another release and never by moving a tag.
   `StageConfig.CacheDirectory`. When alpha is above zero, step manifests gain
   `distillation_loss_before`, `teacher_mass` and `teacher_losses`. Recipes,
   mappings and manifests without these fields keep their digests and bytes.
+- `adapter.ExportQwen35LoRA` writes an F32 LoRA checkpoint from `training/local`
+  as the GGUF adapter the pinned llama.cpp loads over a qwen35 base: pairs
+  `blk.N.<tensor>.weight.lora_a` and `.lora_b` with `adapter.lora.alpha`, each
+  target checked against a base tensor of the same geometry. The
+  linear-attention value heads are reordered to the tiled layout the converter
+  writes, in the V rows of `in_proj_qkv`, the rows of `in_proj_z`, `in_proj_b`
+  and `in_proj_a`, and the columns of `out_proj`. Unknown modules, the MTP
+  block, a rank other than the recipe's and non-finite factors are refused.
+  `WriteInitialLoRA` is unchanged, byte for byte.
 
 ### Fixed
 
