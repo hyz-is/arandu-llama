@@ -1,0 +1,7 @@
+{
+  "template": "qwen3.8-27b",
+  "id": "gsm8k-train-1468",
+  "user": "Troy's home is 75 meters away from school while Emily's home is 98 meters away from school. Troy and Emily walk to school and back home every day. How much farther does Emily walk to school and back in five days?\n\nSolve the problem. Write the final numeric answer on the last line as '#### <number>'.",
+  "finish": "stop",
+  "output": "We need answer math problem. Need solve. Let's parse: Troy's home 75 m from school, Emily's 98 m. They walk to school and back home every day. How much farther does Emily walk to school and back in five days? Need compare total distance Emily walks in 5 days vs Troy? \"How much farther does Emily walk to school and back in five days?\" likely Emily's total distance over five days minus Troy's total distance over five days. Each day round trip: Troy 2*75=150 m, Emily 2*98=196 m. Difference per day 46 m. Over 5 days 230 m. Alternatively compute Emily 5*196=980, Troy 5*150=750, difference 230. Final numeric answer last line #### 230. Need maybe include explanation. Ensure final line exact.\n</think>\n\nEmily walks 98 meters to school and 98 meters back each day, so she walks:\n\n98 + 98 = 196 meters per day.\n\nTroy walks 75 meters to school and 75 meters back each day, so he walks:\n\n75 + 75 = 150 meters per day.\n\nThe difference each day is:\n\n196 - 150 = 46 meters.\n\nOver five days, Emily walks:\n\n46 × 5 = 230 meters farther.\n\n#### 230"
+}

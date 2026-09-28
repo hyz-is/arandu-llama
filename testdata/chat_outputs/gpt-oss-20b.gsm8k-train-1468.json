@@ -1,0 +1,7 @@
+{
+  "template": "gpt-oss-20b",
+  "id": "gsm8k-train-1468",
+  "user": "Troy's home is 75 meters away from school while Emily's home is 98 meters away from school. Troy and Emily walk to school and back home every day. How much farther does Emily walk to school and back in five days?\n\nSolve the problem. Write the final numeric answer on the last line as '#### <number>'.",
+  "finish": "stop",
+  "output": "<|channel|>analysis<|message|>We need to parse the problem: Troy's home is 75 meters away from school. Emily's home is 98 meters away from school. They walk to school and back home every day. How much farther does Emily walk to school and back in five days? So each day, Troy walks 75 meters to school and 75 meters back = 150 meters per day. Emily walks 98 meters to school and 98 meters back = 196 meters per day. The difference per day is 196 - 150 = 46 meters. Over five days, difference is 46 * 5 = 230 meters. So answer: 230 meters. Provide final numeric answer as '#### 230'.<|end|><|start|>assistant<|channel|>final<|message|>Troy walks \\(75 \\text{ m}\\) each way, so \\(150 \\text{ m}\\) per day.  \nEmily walks \\(98 \\text{ m}\\) each way, so \\(196 \\text{ m}\\) per day.  \n\nDifference per day: \\(196 - 150 = 46 \\text{ m}\\).  \nOver five days: \\(46 \\times 5 = 230 \\text{ m}\\).\n\n#### 230"
+}

@@ -184,14 +184,23 @@ typedef struct {
     const char* reasoning_content;  // NULL if empty
 } llama_wrapper_parsed_message;
 
-// Parse model output to extract reasoning/thinking content
-// For streaming: call with is_partial=true, reasoning_format=DEEPSEEK or AUTO
+// Parse model output into content and reasoning with the parser the render
+// returned. parser is the serialized common_peg_arena and generation_prompt
+// the text the render appended to open the answer, both from
+// llama_wrapper_chat_templates_render for the same messages and options. At
+// the pinned llama.cpp every parse is a PEG parse: with no parser the output is
+// read as content, reasoning included, whatever format says, which is why an
+// empty parser also drops generation_prompt -- the pure-content parser would
+// put it in the content. is_partial is true for output that stopped before the
+// model ended it (streaming, or the token ceiling), false for a complete one.
 // Returns NULL on error. Free result with llama_wrapper_free_parsed_message()
 llama_wrapper_parsed_message* llama_wrapper_parse_reasoning(
     const char* text,
     bool is_partial,
     llama_wrapper_reasoning_format format,
-    int chat_format
+    int chat_format,
+    const char* generation_prompt,
+    const char* parser
 );
 
 void llama_wrapper_free_parsed_message(llama_wrapper_parsed_message* msg);
@@ -206,8 +215,13 @@ void llama_wrapper_chat_templates_free(void* templates);
 // Renders the messages and returns the prompt (free with
 // llama_wrapper_free_result), writing the detected common_chat_format to
 // format_out when it is not NULL. enable_thinking is -1 for llama-server's
-// default, 0 or 1 to set it; kwarg values are JSON text. Returns NULL on error
-// with llama_wrapper_last_error set; there is no fallback formatter.
+// default, 0 or 1 to set it; kwarg values are JSON text. reasoning_format
+// decides the parser llama.cpp builds: with NONE its parser leaves reasoning in
+// the content. When not NULL, generation_prompt_out and parser_out receive
+// what llama_wrapper_parse_reasoning needs for output generated from this
+// prompt, each a string to free with llama_wrapper_free_result. Returns NULL on
+// error with llama_wrapper_last_error set and both left NULL; there is no
+// fallback formatter.
 char* llama_wrapper_chat_templates_render(
     void* templates,
     const char** roles,
@@ -215,10 +229,13 @@ char* llama_wrapper_chat_templates_render(
     int n_messages,
     bool add_generation_prompt,
     int enable_thinking,
+    llama_wrapper_reasoning_format reasoning_format,
     const char** kwarg_names,
     const char** kwarg_values,
     int n_kwargs,
-    int* format_out
+    int* format_out,
+    char** generation_prompt_out,
+    char** parser_out
 );
 
 // Model metadata access

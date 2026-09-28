@@ -1397,13 +1397,27 @@ const char* llama_wrapper_get_chat_template(void* model) {
     return tmpl;  // May be nullptr if model has no template
 }
 
-// Parse model output to extract reasoning/thinking content
+// Parse model output to extract reasoning/thinking content, the way
+// llama-server does: with the parser and generation prompt its render built
+// (tools/server/server-schema.cpp, "chat_parser" and "generation_prompt").
+//
+// At the pinned llama.cpp common_chat_parse is always a PEG parse. Without the
+// parser it reads everything as content, and format changes nothing -- the
+// reasoning format acts when the render builds the parser, not here. That is
+// what left gpt-oss's analysis channel, Qwen's thinking and Gemma's thought in
+// the content. The generation prompt is prefixed because the parser starts at
+// the assistant turn the template opened, "<|start|>assistant" for gpt-oss,
+// which the prompt holds and the output does not. With no parser it is left
+// out: the pure-content parser would return it as content.
+//
 // Returns NULL on error. Free result with llama_wrapper_free_parsed_message()
 llama_wrapper_parsed_message* llama_wrapper_parse_reasoning(
     const char* text,
     bool is_partial,
     llama_wrapper_reasoning_format format,
-    int chat_format
+    int chat_format,
+    const char* generation_prompt,
+    const char* parser
 ) {
     if (!text) {
         g_last_error = "Text cannot be null for reasoning parsing";
@@ -1417,6 +1431,10 @@ llama_wrapper_parsed_message* llama_wrapper_parse_reasoning(
         syntax.reasoning_format = static_cast<common_reasoning_format>(format);
         syntax.reasoning_in_content = false;  // Extract to separate field for streaming
         syntax.parse_tool_calls = false;  // Don't need tool parsing for this use case
+        if (parser && parser[0] != '\0') {
+            syntax.parser.load(parser);
+            syntax.generation_prompt = generation_prompt ? generation_prompt : "";
+        }
 
         // Parse the text
         common_chat_msg msg = common_chat_parse(std::string(text), is_partial, syntax);
@@ -1501,6 +1519,12 @@ void llama_wrapper_chat_templates_free(void* templates) {
 //
 // enable_thinking is -1 for llama-server's default (on when the template
 // supports thinking), 0 or 1 to set it. Each kwarg value is JSON text.
+//
+// reasoning_format goes to inputs.reasoning_format, as llama-server sets it
+// (tools/server/server-common.cpp): the parser llama.cpp returns beside the
+// prompt extracts reasoning only when it is not NONE. The parser and the
+// generation prompt are returned because the parse needs both and nothing else
+// can rebuild them.
 char* llama_wrapper_chat_templates_render(
     void* templates,
     const char** roles,
@@ -1508,11 +1532,20 @@ char* llama_wrapper_chat_templates_render(
     int n_messages,
     bool add_generation_prompt,
     int enable_thinking,
+    llama_wrapper_reasoning_format reasoning_format,
     const char** kwarg_names,
     const char** kwarg_values,
     int n_kwargs,
-    int* format_out
+    int* format_out,
+    char** generation_prompt_out,
+    char** parser_out
 ) {
+    if (generation_prompt_out) {
+        *generation_prompt_out = nullptr;
+    }
+    if (parser_out) {
+        *parser_out = nullptr;
+    }
     if (!templates) {
         g_last_error = "Chat templates cannot be null";
         return nullptr;
@@ -1553,19 +1586,39 @@ char* llama_wrapper_chat_templates_render(
         inputs.enable_thinking = enable_thinking < 0
             ? common_chat_templates_support_enable_thinking(tmpls)
             : enable_thinking != 0;
+        inputs.reasoning_format = static_cast<common_reasoning_format>(reasoning_format);
 
         common_chat_params params = common_chat_templates_apply(tmpls, inputs);
 
-        char* result = static_cast<char*>(malloc(params.prompt.size() + 1));
-        if (!result) {
+        // The three strings are copied before any is handed over, so a failed
+        // allocation returns nothing rather than a prompt without its parser.
+        auto copy = [](const std::string & s) {
+            char* out = static_cast<char*>(malloc(s.size() + 1));
+            if (out) {
+                memcpy(out, s.data(), s.size());
+                out[s.size()] = '\0';
+            }
+            return out;
+        };
+        char* result = copy(params.prompt);
+        char* generation_prompt = generation_prompt_out ? copy(params.generation_prompt) : nullptr;
+        char* parser = parser_out ? copy(params.parser) : nullptr;
+        if (!result || (generation_prompt_out && !generation_prompt) || (parser_out && !parser)) {
+            free(result);
+            free(generation_prompt);
+            free(parser);
             g_last_error = "Failed to allocate memory for chat template result";
             return nullptr;
         }
-        memcpy(result, params.prompt.data(), params.prompt.size());
-        result[params.prompt.size()] = '\0';
 
         if (format_out) {
             *format_out = static_cast<int>(params.format);
+        }
+        if (generation_prompt_out) {
+            *generation_prompt_out = generation_prompt;
+        }
+        if (parser_out) {
+            *parser_out = parser;
         }
         return result;
     } catch (const std::exception& e) {

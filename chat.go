@@ -40,12 +40,71 @@ func RenderChatTemplate(messages []ChatMessage, opts ChatOptions) (string, error
 	if opts.ChatTemplate == "" {
 		return "", errors.New("no chat template: RenderChatTemplate renders ChatOptions.ChatTemplate and has no model to read one from")
 	}
-	prompt, _, err := renderChat(nil, messages, opts)
-	return prompt, err
+	rendered, err := renderChat(nil, messages, opts)
+	if err != nil {
+		return "", err
+	}
+	return rendered.prompt, nil
+}
+
+// ParseChatOutput splits output, generated from messages rendered through
+// opts.ChatTemplate, into Content and ReasoningContent the way Chat does,
+// without a model. It exists to read a recorded Output again: the same
+// messages, options and output give Chat's Content and ReasoningContent,
+// because both render the template for its parser and generation prompt and
+// both parse through the same function.
+//
+// finish is the FinishReason the output was generated with, since Chat parses
+// FinishReasonLength output as partial and FinishReasonStop output as
+// complete. The response carries output, finish and a GeneratedTokens of 0,
+// because no tokens were counted here.
+//
+// Like RenderChatTemplate, it renders with empty bos_token and eos_token. The
+// generation prompt is where the assistant turn opens, at the end of the
+// render, so a template that writes those tokens only before it gets the same
+// parser and generation prompt it would get with a model.
+func ParseChatOutput(messages []ChatMessage, opts ChatOptions, output string, finish FinishReason) (*ChatResponse, error) {
+	if opts.ChatTemplate == "" {
+		return nil, errors.New("no chat template: ParseChatOutput renders ChatOptions.ChatTemplate and has no model to read one from")
+	}
+	if finish != FinishReasonStop && finish != FinishReasonLength {
+		return nil, fmt.Errorf("finish reason %q is neither %q nor %q", finish, FinishReasonStop, FinishReasonLength)
+	}
+	rendered, err := renderChat(nil, messages, opts)
+	if err != nil {
+		return nil, err
+	}
+	return rendered.response(output, finish, 0, opts.ReasoningFormat)
+}
+
+// chatRender is what one render of the messages produces: the prompt to
+// generate from, and what llama.cpp built beside it to read the output back.
+type chatRender struct {
+	prompt string
+	// format is the common_chat_format llama.cpp detected. The PEG parse picks
+	// its mapper by it: Gemma 4's thought channel has one of its own.
+	format int
+	// generationPrompt is the text the template appends to open the answer,
+	// "<|start|>assistant" for gpt-oss. The parser starts there, and the output
+	// does not repeat it.
+	generationPrompt string
+	// parser is the serialized PEG arena llama.cpp built for the template and
+	// the reasoning format. Without it every parse is content only.
+	parser string
 }
 
 // formatChatMessages renders messages into the prompt Chat generates from, and
 // returns the chat format llama.cpp detected for the template it rendered.
+func formatChatMessages(model *Model, messages []ChatMessage, opts ChatOptions) (string, int, error) {
+	rendered, err := formatChat(model, messages, opts)
+	if err != nil {
+		return "", 0, err
+	}
+	return rendered.prompt, rendered.format, nil
+}
+
+// formatChat renders messages for a model: the prompt Chat generates from and
+// the parser it reads the output with.
 //
 // The template is opts.ChatTemplate when set and the model's own GGUF template
 // otherwise, and both go through the Jinja engine. A model without a template
@@ -53,27 +112,32 @@ func RenderChatTemplate(messages []ChatMessage, opts ChatOptions) (string, error
 // error rather than a prompt from the legacy formatter: either would generate
 // from a prompt the model was not trained on. For raw completion without a
 // template, use Generate() instead of Chat().
-func formatChatMessages(model *Model, messages []ChatMessage, opts ChatOptions) (string, int, error) {
+func formatChat(model *Model, messages []ChatMessage, opts ChatOptions) (chatRender, error) {
 	// The write lock is for the parsed templates cached on the model, and it
 	// keeps Close from freeing them under a render.
 	model.mu.Lock()
 	defer model.mu.Unlock()
 
 	if model.closed {
-		return "", 0, fmt.Errorf("model is closed")
+		return chatRender{}, fmt.Errorf("model is closed")
 	}
 	return renderChat(model, messages, opts)
 }
 
 // renderChat is the one render path. model is nil when there is no model
 // behind the template; otherwise the caller holds model.mu for writing.
-func renderChat(model *Model, messages []ChatMessage, opts ChatOptions) (string, int, error) {
+func renderChat(model *Model, messages []ChatMessage, opts ChatOptions) (chatRender, error) {
 	if len(messages) == 0 {
-		return "", 0, errors.New("messages cannot be empty")
+		return chatRender{}, errors.New("messages cannot be empty")
+	}
+	// The format is handed to llama.cpp as its own enum, where a value past
+	// the last one would still be "not none" and extract.
+	if opts.ReasoningFormat < ReasoningFormatNone || opts.ReasoningFormat > ReasoningFormatDeepSeek {
+		return chatRender{}, fmt.Errorf("unknown ReasoningFormat %d", int(opts.ReasoningFormat))
 	}
 	thinking, names, values, err := chatTemplateInputs(opts)
 	if err != nil {
-		return "", 0, err
+		return chatRender{}, err
 	}
 
 	var modelPtr unsafe.Pointer
@@ -87,21 +151,21 @@ func renderChat(model *Model, messages []ChatMessage, opts ChatOptions) (string,
 		// Jinja engine it is a template with no tags, whose rendering is the
 		// name itself -- a prompt, and a wrong one, with no error.
 		if !strings.Contains(opts.ChatTemplate, "{{") && !strings.Contains(opts.ChatTemplate, "{%") {
-			return "", 0, errors.New("ChatOptions.ChatTemplate is not a Jinja template (no {{ or {%): built-in format names are not accepted")
+			return chatRender{}, errors.New("ChatOptions.ChatTemplate is not a Jinja template (no {{ or {%): built-in format names are not accepted")
 		}
 		templates, err = initChatTemplates(modelPtr, opts.ChatTemplate)
 		if err != nil {
-			return "", 0, err
+			return chatRender{}, err
 		}
 		defer C.llama_wrapper_chat_templates_free(templates)
 	} else {
 		if modelPtr == nil || C.llama_wrapper_get_chat_template(modelPtr) == nil {
-			return "", 0, errors.New("no chat template available: provide ChatOptions.ChatTemplate or use a model with embedded template (or use Generate() for raw completion)")
+			return chatRender{}, errors.New("no chat template available: provide ChatOptions.ChatTemplate or use a model with embedded template (or use Generate() for raw completion)")
 		}
 		if model.chatTemplates == nil {
 			parsed, err := initChatTemplates(modelPtr, "")
 			if err != nil {
-				return "", 0, err
+				return chatRender{}, err
 			}
 			model.chatTemplates = parsed
 		}
@@ -122,14 +186,23 @@ func renderChat(model *Model, messages []ChatMessage, opts ChatOptions) (string,
 		namesPtr, valuesPtr = &cNames[0], &cValues[0]
 	}
 	var format C.int
+	var generationPrompt, parser *C.char
 	result := C.llama_wrapper_chat_templates_render(templates, &roles[0], &contents[0], C.int(len(messages)),
-		C.bool(true), C.int(thinking), namesPtr, valuesPtr, C.int(len(names)), &format)
+		C.bool(true), C.int(thinking), C.llama_wrapper_reasoning_format(opts.ReasoningFormat),
+		namesPtr, valuesPtr, C.int(len(names)), &format, &generationPrompt, &parser)
 	if result == nil {
-		return "", 0, errors.New(C.GoString(C.llama_wrapper_last_error()))
+		return chatRender{}, errors.New(C.GoString(C.llama_wrapper_last_error()))
 	}
 	defer C.llama_wrapper_free_result(result)
+	defer C.llama_wrapper_free_result(generationPrompt)
+	defer C.llama_wrapper_free_result(parser)
 
-	return C.GoString(result), int(format), nil
+	return chatRender{
+		prompt:           C.GoString(result),
+		format:           int(format),
+		generationPrompt: C.GoString(generationPrompt),
+		parser:           C.GoString(parser),
+	}, nil
 }
 
 // initChatTemplates parses a template for the Jinja engine; the caller frees
@@ -199,21 +272,51 @@ func cStrings(n int, at func(int) string) ([]*C.char, func()) {
 	}
 }
 
-// parseReasoning extracts reasoning/thinking content from model output.
-// Returns content and reasoning_content separately.
-func parseReasoning(text string, format ReasoningFormat, chatFormat int) (content, reasoningContent string, err error) {
-	if format == ReasoningFormatNone || text == "" {
+// response turns output generated from r.prompt into the ChatResponse that
+// Chat and ParseChatOutput both return, so the two cannot disagree about the
+// same output.
+//
+// With ReasoningFormatNone, Content is output unchanged. With any other format
+// a failed parse is an error: the previous behaviour, returning output as
+// Content, handed whoever scored Content the model's reasoning as its answer.
+//
+// Output cut at the token ceiling is parsed as partial, as a stream in
+// progress is: the model did not finish it. llama.cpp's PEG parse is lenient,
+// and for the recorded gpt-oss, Qwen3.8 and Gemma 4 outputs the split is the
+// same either way, an unclosed thinking block included. Where partial differs
+// is output the parser rejects, which it returns empty instead of failing.
+func (r chatRender) response(output string, finish FinishReason, tokens int, format ReasoningFormat) (*ChatResponse, error) {
+	response := &ChatResponse{Output: output, FinishReason: finish, GeneratedTokens: tokens}
+	if format == ReasoningFormatNone {
+		response.Content = output
+		return response, nil
+	}
+	content, reasoning, err := r.parse(output, format, finish == FinishReasonLength)
+	if err != nil {
+		return nil, fmt.Errorf("output that stopped with finish reason %q: %w", finish, err)
+	}
+	response.Content = content
+	response.ReasoningContent = reasoning
+	return response, nil
+}
+
+// parse splits text into content and reasoning with the parser and generation
+// prompt the render built. partial is true for text the model did not finish:
+// a stream in progress, or output cut at the token ceiling.
+func (r chatRender) parse(text string, format ReasoningFormat, partial bool) (content, reasoningContent string, err error) {
+	if format == ReasoningFormatNone {
 		return text, "", nil
 	}
 
 	cText := C.CString(text)
 	defer C.free(unsafe.Pointer(cText))
+	cGenerationPrompt := C.CString(r.generationPrompt)
+	defer C.free(unsafe.Pointer(cGenerationPrompt))
+	cParser := C.CString(r.parser)
+	defer C.free(unsafe.Pointer(cParser))
 
-	cFormat := C.llama_wrapper_reasoning_format(format)
-	cChatFormat := C.int(chatFormat)
-
-	// Parse with is_partial=true for streaming
-	result := C.llama_wrapper_parse_reasoning(cText, C.bool(true), cFormat, cChatFormat)
+	result := C.llama_wrapper_parse_reasoning(cText, C.bool(partial), C.llama_wrapper_reasoning_format(format),
+		C.int(r.format), cGenerationPrompt, cParser)
 	if result == nil {
 		return "", "", fmt.Errorf("failed to parse reasoning: %s", C.GoString(C.llama_wrapper_last_error()))
 	}
@@ -227,18 +330,10 @@ func parseReasoning(text string, format ReasoningFormat, chatFormat int) (conten
 	return content, reasoningContent, nil
 }
 
-// chatWithContext implements non-streaming chat completion using a specific context.
-//
-// This is an internal helper called by Context.Chat().
-func (m *Model) chatWithContext(ctx gocontext.Context, c *Context, messages []ChatMessage, opts ChatOptions) (*ChatResponse, error) {
-	// Build prompt from messages using chat template
-	prompt, chatFormat, err := formatChatMessages(m, messages, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build generation options from chat options
-	// Use user-provided stop words (no defaults - template handles this)
+// chatGenerateOptions is the generation half of opts, shared by Chat and
+// ChatStream. Stop words are the caller's only: the template ends a turn with
+// the model's end-of-generation token.
+func chatGenerateOptions(opts ChatOptions) []GenerateOption {
 	genOpts := []GenerateOption{
 		WithStopWords(opts.StopWords...),
 	}
@@ -258,41 +353,60 @@ func (m *Model) chatWithContext(ctx gocontext.Context, c *Context, messages []Ch
 	if opts.Seed != nil {
 		genOpts = append(genOpts, WithSeed(*opts.Seed))
 	}
+	return genOpts
+}
 
-	// Generate using context's GenerateChannel
-	tokenCh, errCh := c.GenerateChannel(ctx, prompt, genOpts...)
-
-	var content strings.Builder
-
-Loop:
-	for {
-		select {
-		case token, ok := <-tokenCh:
-			if !ok {
-				break Loop
-			}
-			content.WriteString(token)
-		case err := <-errCh:
-			if err != nil {
-				return nil, err
-			}
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	// Parse final output to extract reasoning
-	fullOutput := content.String()
-	parsedContent, reasoning, err := parseReasoning(fullOutput, opts.ReasoningFormat, chatFormat)
+// chatWithContext implements non-streaming chat completion using a specific context.
+//
+// This is an internal helper called by Context.Chat().
+//
+// It generates through the wrapper's loop directly rather than through
+// GenerateChannel, because only the loop knows why it stopped: a channel that
+// closes looks the same after the model's end-of-generation token, after
+// MaxTokens and after a failed decode, and the last two are not answers.
+func (m *Model) chatWithContext(ctx gocontext.Context, c *Context, messages []ChatMessage, opts ChatOptions) (*ChatResponse, error) {
+	rendered, err := formatChat(m, messages, opts)
 	if err != nil {
-		// If parsing fails, return content as-is without reasoning extraction
-		return &ChatResponse{Content: fullOutput}, nil
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	return &ChatResponse{
-		Content:          parsedContent,
-		ReasoningContent: reasoning,
-	}, nil
+	config := defaultGenerateConfig
+	for _, opt := range chatGenerateOptions(opts) {
+		opt(&config)
+	}
+
+	// The callback is how ctx reaches the loop: it runs once per token, and
+	// refusing a token stops generation without appending it.
+	var report generationReport
+	output, err := c.generate(rendered.prompt, config, func(string) bool {
+		return ctx.Err() == nil
+	}, &report)
+	if err != nil {
+		return nil, err
+	}
+
+	var finish FinishReason
+	switch report.stop {
+	case generationStopEOG, generationStopWord:
+		finish = FinishReasonStop
+	case generationStopLength:
+		finish = FinishReasonLength
+	case generationStopCallback:
+		// The callback refuses a token only once ctx is done.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("generation was stopped by its callback after %d tokens with the context still live", report.tokens)
+	case generationStopDecodeFailed:
+		return nil, fmt.Errorf("generation failed: llama_decode failed after %d tokens", report.tokens)
+	default:
+		return nil, fmt.Errorf("generation stopped after %d tokens for a reason the loop did not report", report.tokens)
+	}
+
+	return rendered.response(output, finish, report.tokens, opts.ReasoningFormat)
 }
 
 // chatStreamWithContext implements streaming chat completion using a specific context.
@@ -311,40 +425,22 @@ func (m *Model) chatStreamWithContext(ctx gocontext.Context, c *Context, message
 		defer close(deltaCh)
 		defer close(errCh)
 
-		// Build prompt from messages using chat template
-		prompt, chatFormat, err := formatChatMessages(m, messages, opts)
-		if err != nil {
+		fail := func(err error) {
 			select {
 			case errCh <- err:
 			default:
 			}
+		}
+
+		// Build prompt from messages using chat template
+		rendered, err := formatChat(m, messages, opts)
+		if err != nil {
+			fail(err)
 			return
 		}
 
-		// Build generation options from chat options
-		// Use user-provided stop words (no defaults - template handles this)
-		genOpts := []GenerateOption{
-			WithStopWords(opts.StopWords...),
-		}
-
-		if opts.MaxTokens != nil {
-			genOpts = append(genOpts, WithMaxTokens(*opts.MaxTokens))
-		}
-		if opts.Temperature != nil {
-			genOpts = append(genOpts, WithTemperature(*opts.Temperature))
-		}
-		if opts.TopP != nil {
-			genOpts = append(genOpts, WithTopP(*opts.TopP))
-		}
-		if opts.TopK != nil {
-			genOpts = append(genOpts, WithTopK(*opts.TopK))
-		}
-		if opts.Seed != nil {
-			genOpts = append(genOpts, WithSeed(*opts.Seed))
-		}
-
 		// Use context's GenerateChannel
-		tokenCh, genErrCh := c.GenerateChannel(ctx, prompt, genOpts...)
+		tokenCh, genErrCh := c.GenerateChannel(ctx, rendered.prompt, chatGenerateOptions(opts)...)
 
 		// Track accumulated output and previous parsed state for delta computation
 		var accumulated strings.Builder
@@ -361,8 +457,9 @@ func (m *Model) chatStreamWithContext(ctx gocontext.Context, c *Context, message
 				// Accumulate token
 				accumulated.WriteString(token)
 
-				// Parse accumulated output to extract reasoning
-				content, reasoning, err := parseReasoning(accumulated.String(), opts.ReasoningFormat, chatFormat)
+				// Parse accumulated output to extract reasoning. Every parse is
+				// partial: the stream does not know which token is the last.
+				content, reasoning, err := rendered.parse(accumulated.String(), opts.ReasoningFormat, true)
 				if err != nil {
 					// If parsing fails, send token as-is without reasoning extraction
 					select {
@@ -373,9 +470,20 @@ func (m *Model) chatStreamWithContext(ctx gocontext.Context, c *Context, message
 					continue
 				}
 
-				// Compute deltas (what's new since last parse)
-				contentDelta := content[len(prevContent):]
-				reasoningDelta := reasoning[len(prevReasoning):]
+				// Compute deltas (what's new since last parse). With a parser
+				// that extracts, a partial parse can read a tag's first bytes as
+				// text and give them back once the tag completes, so the new
+				// parse is not always an extension of the last one.
+				contentDelta, err := streamDelta("content", prevContent, content)
+				if err != nil {
+					fail(err)
+					return
+				}
+				reasoningDelta, err := streamDelta("reasoning", prevReasoning, reasoning)
+				if err != nil {
+					fail(err)
+					return
+				}
 
 				// Send delta if there's new content or reasoning
 				if contentDelta != "" || reasoningDelta != "" {
@@ -395,10 +503,7 @@ func (m *Model) chatStreamWithContext(ctx gocontext.Context, c *Context, message
 
 			case err := <-genErrCh:
 				if err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
+					fail(err)
 					return
 				}
 			case <-ctx.Done():
@@ -408,6 +513,21 @@ func (m *Model) chatStreamWithContext(ctx gocontext.Context, c *Context, message
 	}()
 
 	return deltaCh, errCh
+}
+
+// streamDelta is what current adds to what was already streamed as last, by
+// the rule llama.cpp's string_diff follows for llama-server's deltas: a
+// current that is a prefix of last sends nothing, and one that neither
+// extends nor shortens last is an error, since what was sent cannot be taken
+// back.
+func streamDelta(field, last, current string) (string, error) {
+	if strings.HasPrefix(current, last) {
+		return current[len(last):], nil
+	}
+	if strings.HasPrefix(last, current) {
+		return "", nil
+	}
+	return "", fmt.Errorf("the %d bytes of %s already streamed are not a prefix of the next parse's %d", len(last), field, len(current))
 }
 
 // Int returns a pointer to the given int value.

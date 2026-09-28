@@ -19,9 +19,10 @@ type ChatMessage struct {
 
 // ChatResponse represents the complete response from a chat completion.
 //
-// For standard models, only Content is populated. For reasoning models
-// (like DeepSeek-R1), ReasoningContent may contain extracted thinking/
-// reasoning tokens that were separated from the main response.
+// With ReasoningFormatNone, Content is Output unchanged. With any other
+// format, Output is split by the parser llama.cpp builds for the template:
+// thinking goes to ReasoningContent and the answer to Content, and output the
+// parser does not accept is an error rather than a Content holding both.
 //
 // Example:
 //
@@ -36,8 +37,36 @@ type ChatMessage struct {
 type ChatResponse struct {
 	Content          string // Regular response content
 	ReasoningContent string // Extracted reasoning/thinking (if reasoning model)
-	// Future fields: ToolCalls, FinishReason, Usage, etc.
+
+	// Output is the generated text before any parse, special tokens written
+	// as text: "<|channel|>analysis<|message|>..." for gpt-oss. It is what
+	// ParseChatOutput takes to reproduce Content and ReasoningContent.
+	Output string
+
+	// FinishReason is why generation stopped. With FinishReasonLength the
+	// answer was cut at MaxTokens, and Content may be empty or unfinished
+	// while ReasoningContent holds the thinking that used the budget.
+	FinishReason FinishReason
+
+	// GeneratedTokens is the number of tokens whose pieces make up Output,
+	// counted by the generation loop rather than by tokenizing Output again.
+	// The end-of-generation token is not among them.
+	GeneratedTokens int
 }
+
+// FinishReason is why a chat completion stopped, named as in the OpenAI chat
+// API that llama-server serves.
+type FinishReason string
+
+const (
+	// FinishReasonStop means the model ended the answer itself, with its
+	// end-of-generation token or one of ChatOptions.StopWords.
+	FinishReasonStop FinishReason = "stop"
+
+	// FinishReasonLength means ChatOptions.MaxTokens tokens were generated
+	// before the model ended the answer.
+	FinishReasonLength FinishReason = "length"
+)
 
 // ChatDelta represents a streaming chunk from chat completion.
 //
