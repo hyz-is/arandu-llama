@@ -214,7 +214,12 @@ void* llama_wrapper_chat_templates_init(void* model, const char* template_overri
 void llama_wrapper_chat_templates_free(void* templates);
 // Renders the messages and returns the prompt (free with
 // llama_wrapper_free_result), writing the detected common_chat_format to
-// format_out when it is not NULL. enable_thinking is -1 for llama-server's
+// format_out when it is not NULL. reasoning_contents is NULL or holds one
+// entry per message, NULL or empty for a message without reasoning, and each
+// other entry becomes that message's reasoning_content, which a template that
+// writes thinking into an assistant turn reads. With add_generation_prompt
+// false the render ends with the last message, as a recorded conversation
+// does. enable_thinking is -1 for llama-server's
 // default, 0 or 1 to set it; kwarg values are JSON text. reasoning_format
 // decides the parser llama.cpp builds: with NONE its parser leaves reasoning in
 // the content. When not NULL, generation_prompt_out and parser_out receive
@@ -226,6 +231,7 @@ char* llama_wrapper_chat_templates_render(
     void* templates,
     const char** roles,
     const char** contents,
+    const char** reasoning_contents,
     int n_messages,
     bool add_generation_prompt,
     int enable_thinking,

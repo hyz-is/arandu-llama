@@ -30,7 +30,9 @@ const ChatTemplateEngine = "arandu-llama.chat-jinja.v1/llama.cpp.90c26fcd"
 
 // RenderChatTemplate renders messages through opts.ChatTemplate with the
 // engine ChatTemplateEngine names, ending with the generation prompt, without
-// a model.
+// a model. With opts.AddGenerationPrompt false it ends with the last message
+// instead, which is how a conversation with its assistant turn is rendered
+// for training.
 //
 // With no vocabulary behind it the template sees empty bos_token and
 // eos_token. For a model whose vocabulary adds BOS itself, Gemma 4 among them,
@@ -70,11 +72,26 @@ func ParseChatOutput(messages []ChatMessage, opts ChatOptions, output string, fi
 	if finish != FinishReasonStop && finish != FinishReasonLength {
 		return nil, fmt.Errorf("finish reason %q is neither %q nor %q", finish, FinishReasonStop, FinishReasonLength)
 	}
+	if err := requireGenerationPrompt(opts, "ParseChatOutput"); err != nil {
+		return nil, err
+	}
 	rendered, err := renderChat(nil, messages, opts)
 	if err != nil {
 		return nil, err
 	}
 	return rendered.response(output, finish, 0, opts.ReasoningFormat)
+}
+
+// requireGenerationPrompt refuses opts that render without the generation
+// prompt where output is generated or read back. The output begins where the
+// generation prompt ends; a render that stops after the last message has no
+// such place, and a model given it would write the next turn's header rather
+// than an answer.
+func requireGenerationPrompt(opts ChatOptions, caller string) error {
+	if opts.AddGenerationPrompt != nil && !*opts.AddGenerationPrompt {
+		return fmt.Errorf("%s needs the generation prompt: ChatOptions.AddGenerationPrompt false renders a finished conversation, which RenderChatTemplate returns", caller)
+	}
+	return nil
 }
 
 // chatRender is what one render of the messages produces: the prompt to
@@ -176,6 +193,11 @@ func renderChat(model *Model, messages []ChatMessage, opts ChatOptions) (chatRen
 	defer freeRoles()
 	contents, freeContents := cStrings(len(messages), func(i int) string { return messages[i].Content })
 	defer freeContents()
+	// Every message gets an entry, empty for no reasoning: llama.cpp hands the
+	// template a reasoning_content only when it is not empty, so a message
+	// without one renders as it did before the field existed.
+	reasoning, freeReasoning := cStrings(len(messages), func(i int) string { return messages[i].ReasoningContent })
+	defer freeReasoning()
 	cNames, freeNames := cStrings(len(names), func(i int) string { return names[i] })
 	defer freeNames()
 	cValues, freeValues := cStrings(len(values), func(i int) string { return values[i] })
@@ -185,10 +207,11 @@ func renderChat(model *Model, messages []ChatMessage, opts ChatOptions) (chatRen
 	if len(names) > 0 {
 		namesPtr, valuesPtr = &cNames[0], &cValues[0]
 	}
+	addGenerationPrompt := opts.AddGenerationPrompt == nil || *opts.AddGenerationPrompt
 	var format C.int
 	var generationPrompt, parser *C.char
-	result := C.llama_wrapper_chat_templates_render(templates, &roles[0], &contents[0], C.int(len(messages)),
-		C.bool(true), C.int(thinking), C.llama_wrapper_reasoning_format(opts.ReasoningFormat),
+	result := C.llama_wrapper_chat_templates_render(templates, &roles[0], &contents[0], &reasoning[0], C.int(len(messages)),
+		C.bool(addGenerationPrompt), C.int(thinking), C.llama_wrapper_reasoning_format(opts.ReasoningFormat),
 		namesPtr, valuesPtr, C.int(len(names)), &format, &generationPrompt, &parser)
 	if result == nil {
 		return chatRender{}, errors.New(C.GoString(C.llama_wrapper_last_error()))
@@ -368,6 +391,9 @@ func chatGenerateOptions(opts ChatOptions) []GenerateOption {
 // closes looks the same after the model's end-of-generation token, after
 // MaxTokens and after a failed decode, and the last two are not answers.
 func (m *Model) chatWithContext(ctx gocontext.Context, c *Context, messages []ChatMessage, opts ChatOptions) (*ChatResponse, error) {
+	if err := requireGenerationPrompt(opts, "Chat"); err != nil {
+		return nil, err
+	}
 	rendered, err := formatChat(m, messages, opts)
 	if err != nil {
 		return nil, err
@@ -433,6 +459,11 @@ func (m *Model) chatStreamWithContext(ctx gocontext.Context, c *Context, message
 			case errCh <- err:
 			default:
 			}
+		}
+
+		if err := requireGenerationPrompt(opts, "ChatStream"); err != nil {
+			fail(err)
+			return
 		}
 
 		// Build prompt from messages using chat template

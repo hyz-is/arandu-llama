@@ -15,6 +15,15 @@ package llama
 type ChatMessage struct {
 	Role    string // Message role (e.g., "system", "user", "assistant")
 	Content string // Message content
+
+	// ReasoningContent is an assistant turn's thinking, kept apart from its
+	// answer in Content the way ChatResponse keeps them. It reaches the
+	// template as the message's reasoning_content, and a template that
+	// writes thinking into the turn puts it there -- between <think> and
+	// </think> for the Ornith. Empty is no reasoning, and the message renders
+	// as it did before the field existed. A template that never reads
+	// reasoning_content drops it without an error.
+	ReasoningContent string
 }
 
 // ChatResponse represents the complete response from a chat completion.

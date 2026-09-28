@@ -1520,6 +1520,11 @@ void llama_wrapper_chat_templates_free(void* templates) {
 // enable_thinking is -1 for llama-server's default (on when the template
 // supports thinking), 0 or 1 to set it. Each kwarg value is JSON text.
 //
+// reasoning_contents[i] goes to the message's reasoning_content, which
+// common_chat_msg writes into the template's message only when it is not
+// empty: an empty entry and a NULL one render the same message as before the
+// field existed, so callers that pass no reasoning get the prompt they got.
+//
 // reasoning_format goes to inputs.reasoning_format, as llama-server sets it
 // (tools/server/server-common.cpp): the parser llama.cpp returns beside the
 // prompt extracts reasoning only when it is not NONE. The parser and the
@@ -1529,6 +1534,7 @@ char* llama_wrapper_chat_templates_render(
     void* templates,
     const char** roles,
     const char** contents,
+    const char** reasoning_contents,
     int n_messages,
     bool add_generation_prompt,
     int enable_thinking,
@@ -1574,6 +1580,9 @@ char* llama_wrapper_chat_templates_render(
             common_chat_msg msg;
             msg.role = roles[i];
             msg.content = contents[i];
+            if (reasoning_contents && reasoning_contents[i]) {
+                msg.reasoning_content = reasoning_contents[i];
+            }
             inputs.messages.push_back(std::move(msg));
         }
         for (int i = 0; i < n_kwargs; i++) {

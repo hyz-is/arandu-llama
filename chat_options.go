@@ -35,6 +35,17 @@ type ChatOptions struct {
 	// "enable_thinking" entry must be a bool and agree with EnableThinking.
 	ChatTemplateKwargs map[string]interface{}
 
+	// AddGenerationPrompt is the template's add_generation_prompt. nil and
+	// true render what Chat generates from: the messages, then the text that
+	// opens the assistant's answer. false renders the messages alone, ending
+	// with the last one, which is how a finished conversation is written --
+	// an assistant turn recorded for training, say.
+	//
+	// RenderChatTemplate and Model.FormatChatPrompt honor false. Chat,
+	// ChatStream and ParseChatOutput refuse it: output begins where the
+	// generation prompt ends, and without one there is no such place.
+	AddGenerationPrompt *bool
+
 	// Reasoning model options (for models like DeepSeek-R1)
 	EnableThinking  *bool           // Template's enable_thinking (nil = llama-server's default: on when the template supports thinking)
 	ReasoningBudget *int            // Token limit for reasoning (-1 = unlimited, 0 = disabled)
