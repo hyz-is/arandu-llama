@@ -38,6 +38,14 @@ a release is corrected by another release and never by moving a tag.
   end of turn, and the student's tokenizer encodes both, with -100 labels over
   the prompt. `Report.JointAgrees` says whether encoding the whole text agrees
   with the prompt-then-completion boundary.
+- `training/bridge` re-expresses a teacher's next-token distribution over a
+  student vocabulary with another tokenizer, by Byte-Prefix Marginalization
+  (arXiv 2607.22334). It is pure Go and decodes the exact bytes of byte-level
+  BPE and SentencePiece-convention vocabularies from a GGUF or a
+  `tokenizer.json`. It aligns the realized segmentations and labels each row
+  exact or lower bound. Mass is conserved: the cells plus the residual, stop,
+  special and uncovered mass sum to one. It is not wired to `fusioncache` or
+  to training.
 
 ### Fixed
 
