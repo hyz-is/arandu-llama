@@ -130,6 +130,21 @@ a release is corrected by another release and never by moving a tag.
   predecessor in the store, and a package can be corrected only once.
   `History`, `Successor`, `FreezeManifest` and `ReadManifest` read the chain
   back.
+- `trajectory.Example.AnswerOnly` declares a row of the answer alone, with no
+  trajectory.
+  - Its prompt is the one a trajectory row for the same messages gets, with
+    thinking on.
+  - Its completion is what the template writes for an assistant turn with empty
+    reasoning and the answer as content. Through the Ornith's template that is
+    `"\n</think>\n\n#### 42<|im_end|>"`.
+  - `Render` refuses any other text in the completion, including reasoning the
+    template extracts from the content.
+  - Reasoning in an answer-only example is refused, and empty reasoning is still
+    refused in an example that does not declare it.
+
+  With the Ornith's tokenizer, an answer-only row reports `JointAgrees` false:
+  the prompt's last newline and the completion's first one merge when the whole
+  text is tokenized.
 
 ### Fixed
 
