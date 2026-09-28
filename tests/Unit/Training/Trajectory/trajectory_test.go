@@ -18,7 +18,8 @@ import (
 	"github.com/tayi-ai/arandu-llama/training/trajectory"
 )
 
-// A verified teacher trajectory, turned into a row the student trains on.
+// A verified teacher trajectory, turned into a row the student trains on --
+// and the answer alone, the row that carries no trajectory.
 //
 // The trajectory is a real one: Qwen3.8's answer to gsm8k-train-1468 from the
 // teacher smoke run, split into reasoning and answer by the parser Chat uses.
@@ -237,6 +238,152 @@ func TestATrajectoryCutAtTheCeilingIsRefused(t *testing.T) {
 	text, err := trajectory.Render(ornithTemplate(t), ornithEndOfTurn, example)
 	if err == nil || !strings.Contains(err.Error(), "empty answer") {
 		t.Fatalf("a trajectory without an answer gave %+v and %v, want the empty answer refused", text, err)
+	}
+}
+
+// answerOnly is example's row without its trajectory: the same question, the
+// level declared, and answer as the whole of the assistant's turn.
+func answerOnly(example trajectory.Example, answer string) trajectory.Example {
+	return trajectory.Example{ID: example.ID, Messages: example.Messages, AnswerOnly: true, Answer: answer}
+}
+
+// gsm8k1468Answer is the reference answer of gsm8k-train-1468 in the form the
+// verifier reads: 23 meters farther each way, twice a day, for five days.
+const gsm8k1468Answer = "#### 230"
+
+func TestAnAnswerOnlyRowIsGivenTheTrajectoryRowsPrompt(t *testing.T) {
+	template := ornithTemplate(t)
+	full := recordedTrajectory(t, "qwen3.8-27b.gsm8k-train-1468")
+	withReasoning, err := trajectory.Render(template, ornithEndOfTurn, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, err := trajectory.Render(template, ornithEndOfTurn, answerOnly(full, gsm8k1468Answer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("prompt     %q", abbreviate(text.Prompt))
+	t.Logf("completion %q", text.Completion)
+	t.Logf("tail       %q", text.Tail)
+
+	// The two rows differ in what the student writes, never in what it is
+	// given: the same bytes, thinking on, open inside <think>.
+	if text.Prompt != withReasoning.Prompt {
+		at := 0
+		for at < len(text.Prompt) && at < len(withReasoning.Prompt) && text.Prompt[at] == withReasoning.Prompt[at] {
+			at++
+		}
+		t.Fatalf("the answer-only prompt parts from the trajectory's at byte %d of %d and %d", at, len(text.Prompt), len(withReasoning.Prompt))
+	}
+	if !strings.HasSuffix(text.Prompt, "<|im_start|>assistant\n<think>\n") {
+		t.Errorf("the answer-only prompt does not end inside the thinking block: %q", abbreviate(text.Prompt))
+	}
+
+	// What the Ornith's template writes for an assistant turn with empty
+	// reasoning: a newline that leaves the block the prompt opened empty, its
+	// close, a blank line, the answer and the end of turn.
+	if want := "\n</think>\n\n" + gsm8k1468Answer + ornithEndOfTurn; text.Completion != want {
+		t.Fatalf("the answer-only completion is\n%q\nwant\n%q", text.Completion, want)
+	}
+	if text.Tail != withReasoning.Tail || text.Tail != "\n" {
+		t.Errorf("the answer-only tail is %q, want the template's newline", text.Tail)
+	}
+}
+
+func TestTheOrnithWritesTheAnswerOnlyTurnItIsGiven(t *testing.T) {
+	// The template trims the answer, so surrounding space does not reach the
+	// row; the answer is otherwise written as it is.
+	template := ornithTemplate(t)
+	for answer, want := range map[string]string{
+		"#### 5":      "\n</think>\n\n#### 5<|im_end|>",
+		"#### 42":     "\n</think>\n\n#### 42<|im_end|>",
+		"  #### 42\n": "\n</think>\n\n#### 42<|im_end|>",
+		"#### -3/4":   "\n</think>\n\n#### -3/4<|im_end|>",
+	} {
+		text, err := trajectory.Render(template, ornithEndOfTurn, answerOnly(arithmetic, answer))
+		if err != nil {
+			t.Errorf("answer %q: %v", answer, err)
+			continue
+		}
+		if text.Completion != want {
+			t.Errorf("answer %q gave the completion %q, want %q", answer, text.Completion, want)
+		}
+	}
+}
+
+func TestTheLevelIsDeclaredAndTheReasoningAgreesWithIt(t *testing.T) {
+	template := ornithTemplate(t)
+	for name, c := range map[string]struct {
+		example trajectory.Example
+		refusal string
+	}{
+		"an answer-only example with reasoning": {
+			trajectory.Example{ID: "a", Messages: arithmetic.Messages, AnswerOnly: true, Reasoning: arithmetic.Reasoning, Answer: arithmetic.Answer},
+			"reasoning in an answer-only example"},
+		"an answer-only example with whitespace reasoning": {
+			trajectory.Example{ID: "a", Messages: arithmetic.Messages, AnswerOnly: true, Reasoning: " \n", Answer: arithmetic.Answer},
+			"reasoning in an answer-only example"},
+		"a trajectory without reasoning": {
+			trajectory.Example{ID: "a", Messages: arithmetic.Messages, Answer: arithmetic.Answer},
+			"empty reasoning in an example that does not declare AnswerOnly"},
+		"a trajectory with whitespace reasoning": {
+			trajectory.Example{ID: "a", Messages: arithmetic.Messages, Reasoning: "\n\t", Answer: arithmetic.Answer},
+			"empty reasoning in an example that does not declare AnswerOnly"},
+		"an answer-only example without an answer": {
+			trajectory.Example{ID: "a", Messages: arithmetic.Messages, AnswerOnly: true},
+			"empty answer"},
+		"an answer-only example with a whitespace answer": {
+			trajectory.Example{ID: "a", Messages: arithmetic.Messages, AnswerOnly: true, Answer: " \n"},
+			"empty answer"},
+	} {
+		text, err := trajectory.Render(template, ornithEndOfTurn, c.example)
+		if err == nil || !strings.Contains(err.Error(), c.refusal) {
+			t.Errorf("%s gave %+v and %v, want %q", name, text, err, c.refusal)
+		}
+	}
+}
+
+func TestAnAnswerOnlyTurnHoldsTheAnswerAndNothingElse(t *testing.T) {
+	template := ornithTemplate(t)
+
+	// Handed no reasoning_content, the Ornith's template takes what precedes
+	// a </think> in the content as reasoning: this answer renders as a
+	// trajectory, the reasoning inside the block the prompt opened.
+	smuggled := answerOnly(arithmetic, arithmetic.Reasoning+"\n</think>\n\n#### 5")
+	conversation := append(slices.Clone(smuggled.Messages), llama.ChatMessage{Role: "assistant", Content: smuggled.Answer})
+	full, err := llama.RenderChatTemplate(conversation, llama.ChatOptions{ChatTemplate: template, EnableThinking: llama.Bool(true), AddGenerationPrompt: llama.Bool(false)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(full, "<think>\n"+arithmetic.Reasoning+"\n</think>\n\n#### 5<|im_end|>") {
+		t.Fatalf("the template no longer takes reasoning out of the content, and this case shows nothing: %q", full)
+	}
+	text, err := trajectory.Render(template, ornithEndOfTurn, smuggled)
+	if err == nil || !strings.Contains(err.Error(), "does not open with") || !strings.Contains(err.Error(), arithmetic.Reasoning) {
+		t.Errorf("an answer the template turns into a trajectory gave %+v and %v, want the reasoning refused", text, err)
+	}
+
+	// A thinking template that drops the content: the turn opens as the empty
+	// turn does, and there is no answer after the opening.
+	const droppedAnswer = "{% for m in messages %}{% if m.role == 'user' %}<|im_start|>user\n{{ m.content }}<|im_end|>\n" +
+		"{% else %}<|im_start|>assistant\n<think>\n{{ m.reasoning_content }}\n</think>\n\n<|im_end|>\n{% endif %}{% endfor %}" +
+		"{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}"
+	text, err = trajectory.Render(droppedAnswer, ornithEndOfTurn, answerOnly(arithmetic, "#### 5"))
+	if err == nil || !strings.Contains(err.Error(), "want the answer") {
+		t.Errorf("a template that drops the answer gave %+v and %v, want a refusal", text, err)
+	}
+
+	// The opening is the template's, not the Ornith's: one that writes no
+	// thinking has none, refuses the trajectory, and takes the answer alone.
+	if _, err := trajectory.Render(plainPrompt, ornithEndOfTurn, arithmetic); err == nil {
+		t.Errorf("a template without reasoning took the trajectory")
+	}
+	text, err = trajectory.Render(plainPrompt, ornithEndOfTurn, answerOnly(arithmetic, "#### 5"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "#### 5" + ornithEndOfTurn; text.Completion != want {
+		t.Errorf("a template without thinking gave the completion %q, want %q", text.Completion, want)
 	}
 }
 
@@ -523,6 +670,61 @@ func TestTheEndOfTurnMustBeOneTokenAndEveryIDInTheVocabulary(t *testing.T) {
 	}
 }
 
+func TestAnAnswerOnlyRowIsWhatTheCurriculumAdmits(t *testing.T) {
+	ctx := context.Background()
+	student := trajectory.Student{
+		ChatTemplate: ornithTemplate(t),
+		EndOfTurn:    ornithEndOfTurn,
+		Tokenizer:    byteLevel(t, ornithSpecials),
+		Vocabulary:   ornithEmbeddingRows,
+	}
+	full := recordedTrajectory(t, "qwen3.8-27b.gsm8k-train-1468")
+	withReasoning, _, err := trajectory.Build(ctx, student, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, report, err := trajectory.Build(ctx, student, answerOnly(full, gsm8k1468Answer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkRow(t, student, row, report)
+
+	// The prompt's tokens are the trajectory row's, and every one of them is
+	// masked; only the completion is trained.
+	if row.PromptTokens != withReasoning.PromptTokens || !slices.Equal(row.InputIDs[:row.PromptTokens], withReasoning.InputIDs[:withReasoning.PromptTokens]) {
+		t.Errorf("the answer-only row's prompt is %d tokens, the trajectory row's %d, and they differ", row.PromptTokens, withReasoning.PromptTokens)
+	}
+	want := []int64{'\n', ornithSpecials["</think>"], '\n', '\n'}
+	for _, b := range []byte(gsm8k1468Answer) {
+		want = append(want, int64(b))
+	}
+	want = append(want, ornithSpecials["<|im_end|>"])
+	if completion := row.InputIDs[row.PromptTokens:]; !slices.Equal(completion, want) {
+		t.Errorf("the answer-only completion is %v, want %v", completion, want)
+	}
+	if !report.JointAgrees {
+		t.Errorf("a tokenizer with no piece longer than a byte disagreed with itself at the boundary")
+	}
+
+	// With a piece for the blank line, which the Ornith's tokenizer has, the
+	// prompt's last newline and the completion's first are that piece when
+	// the text is tokenized whole. The row keeps the boundary the student
+	// meets, and the report says the whole text would not. The trajectory row
+	// is untouched: its reasoning begins with a letter.
+	student.Tokenizer = byteLevel(t, ornithSpecials, "\n\n")
+	row, report, err = trajectory.Build(ctx, student, answerOnly(full, gsm8k1468Answer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkRow(t, student, row, report)
+	if report.JointAgrees {
+		t.Errorf("the blank line across the answer-only boundary was reported as agreeing")
+	}
+	if _, fullReport, err := trajectory.Build(ctx, student, full); err != nil || !fullReport.JointAgrees {
+		t.Errorf("the trajectory row disagrees at its boundary (%v): %t", err, fullReport.JointAgrees)
+	}
+}
+
 // ornithTokenizerSHA256 is the Ornith's tokenizer.json at the revision its
 // template comes from. The file is not downloaded or kept here:
 // TRAJECTORY_ORNITH_TOKENIZER_JSON names a copy, and Load refuses any other.
@@ -596,4 +798,55 @@ func TestTheOrnithTokenizerWritesTheRowOptIn(t *testing.T) {
 	if _, _, err := trajectory.Build(ctx, student, arithmetic); err == nil || !strings.Contains(err.Error(), "outside the student's vocabulary") {
 		t.Errorf("a vocabulary without a row for <|im_end|> gave %v, want a refusal", err)
 	}
+}
+
+func TestTheOrnithTokenizerWritesTheAnswerOnlyRowOptIn(t *testing.T) {
+	loaded := ornithTokenizer(t)
+	ctx := context.Background()
+	student := trajectory.Student{ChatTemplate: ornithTemplate(t), EndOfTurn: ornithEndOfTurn, Tokenizer: loaded, Vocabulary: ornithEmbeddingRows}
+	full := recordedTrajectory(t, "qwen3.8-27b.gsm8k-train-1468")
+	withReasoning, _, err := trajectory.Build(ctx, student, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, report, err := trajectory.Build(ctx, student, answerOnly(full, gsm8k1468Answer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkRow(t, student, row, report)
+	if row.PromptTokens != withReasoning.PromptTokens || !slices.Equal(row.InputIDs[:row.PromptTokens], withReasoning.InputIDs[:withReasoning.PromptTokens]) {
+		t.Errorf("the answer-only row's prompt is %d tokens, the trajectory row's %d, and they differ", row.PromptTokens, withReasoning.PromptTokens)
+	}
+
+	// The completion as the Ornith's tokenizer writes it: the newline 198,
+	// </think>, the blank line 271, "####" 794, the space 220, the digits of
+	// 230 one token each, and <|im_end|>.
+	const blankLine = 271
+	completion := row.InputIDs[row.PromptTokens:]
+	want := []int64{198, ornithSpecials["</think>"], blankLine, 794, 220, 17, 18, 15, ornithSpecials["<|im_end|>"]}
+	if !slices.Equal(completion, want) {
+		t.Errorf("the answer-only completion is %v, want %v", completion, want)
+	}
+	if last := completion[len(completion)-1]; last != 248046 {
+		t.Errorf("the answer-only completion ends with %d, want <|im_end|> 248046", last)
+	}
+	if ids, err := loaded.Encode(ctx, "\n\n"); err != nil || !slices.Equal(ids, []int64{blankLine}) {
+		t.Fatalf("the Ornith tokenizes a blank line as %v (%v), want [%d]", ids, err, blankLine)
+	}
+
+	// Tokenized whole, "<think>\n" and "\n</think>" meet in the blank line:
+	// the joint encoding is the row with the prompt's last newline and the
+	// completion's first replaced by 271, and nowhere else different.
+	joint, err := loaded.Encode(ctx, report.Text.Prompt+report.Text.Completion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := append(slices.Clone(row.InputIDs[:row.PromptTokens-1]), blankLine)
+	merged = append(merged, completion[1:]...)
+	if report.JointAgrees || !slices.Equal(joint, merged) {
+		t.Errorf("the joint encoding agrees: %t; it is the row with the two newlines merged: %t", report.JointAgrees, slices.Equal(joint, merged))
+	}
+	t.Logf("%s answer-only: %d tokens = %d prompt + %d completion; prompt ends %v; completion %v; joint encoding agrees: %t, joint at the boundary %v",
+		row.ID, len(row.InputIDs), row.PromptTokens, len(completion), row.InputIDs[row.PromptTokens-2:row.PromptTokens], completion,
+		report.JointAgrees, joint[row.PromptTokens-2:row.PromptTokens+1])
 }

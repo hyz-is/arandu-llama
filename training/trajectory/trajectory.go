@@ -5,6 +5,11 @@
 // depend on its tokenizer, so any family can supply it, but a row the student
 // trains on has to be what the student sees at inference.
 //
+// A row can also carry the answer alone, with no trajectory, when the example
+// declares it with AnswerOnly. It is given the same prompt a trajectory row
+// for the same question is given, so the two differ only in what the student
+// is trained to write.
+//
 // Choosing which trajectories deserve a row is the verifier's job, not this
 // package's: Build writes a row for whatever it is given.
 package trajectory
@@ -31,6 +36,21 @@ type Example struct {
 	// Messages is the conversation the teacher answered, ending with the user
 	// turn the answer replies to.
 	Messages []llama.ChatMessage
+	// AnswerOnly declares a row of the answer alone, with no trajectory: the
+	// level-L0 row. Reasoning must then be empty, and any other value is
+	// refused, whitespace included. Without it an empty Reasoning is refused,
+	// so a row without reasoning is always one somebody declared.
+	//
+	// The prompt is unchanged, thinking on. The completion is what the
+	// template writes for an assistant turn with empty reasoning and Answer as
+	// its content, and nothing else. Through the Ornith's template, the answer
+	// "#### 42" gives
+	//
+	//	"\n</think>\n\n#### 42<|im_end|>"
+	//
+	// the newline that leaves the thinking block the prompt opened empty, its
+	// close, a blank line, the answer and the end of turn.
+	AnswerOnly bool
 	// Reasoning is the teacher's thinking, ChatResponse.ReasoningContent.
 	Reasoning string
 	// Answer is the teacher's final answer, ChatResponse.Content.
@@ -62,7 +82,8 @@ type Text struct {
 	Prompt string
 	// Completion is what the conversation with the assistant's turn adds
 	// after Prompt, through EndOfTurn: the reasoning, the template's close of
-	// the thinking block, the answer and EndOfTurn itself.
+	// the thinking block, the answer and EndOfTurn itself. For an AnswerOnly
+	// example there is no reasoning, and the close is that of an empty block.
 	Completion string
 	// Tail is what the template writes after EndOfTurn -- "\n" for the Ornith.
 	// It is not trained: generation stops on EndOfTurn, so the student never
@@ -107,6 +128,16 @@ type Report struct {
 //
 // The template decides whitespace. The Ornith's trims the reasoning and the
 // answer, so the text in the completion is theirs without surrounding space.
+//
+// An AnswerOnly example has no reasoning to look for, and is held to more than
+// holding the answer. The messages are rendered once more with an assistant
+// turn that holds nothing, and the completion must be that turn's opening --
+// what the template writes before an empty answer, the Ornith's "\n</think>\n\n"
+// -- followed by the answer, up to surrounding space, and endOfTurn. Any other
+// text is refused. That is what keeps reasoning out of the row when the
+// template finds some by itself: the Ornith's, handed no reasoning_content,
+// takes whatever precedes a "</think>" in the content as reasoning, so an
+// answer holding one renders as a trajectory.
 func Render(chatTemplate, endOfTurn string, example Example) (Text, error) {
 	if err := example.validate(); err != nil {
 		return Text{}, err
@@ -119,6 +150,47 @@ func Render(chatTemplate, endOfTurn string, example Example) (Text, error) {
 	if err != nil {
 		return Text{}, fmt.Errorf("trajectory %q: rendering the prompt: %w", example.ID, err)
 	}
+	completion, tail, err := assistantTurn(opts, prompt, endOfTurn, "the assistant's turn", example)
+	if err != nil {
+		return Text{}, err
+	}
+	text := Text{Prompt: prompt, Completion: completion, Tail: tail}
+	answer := strings.TrimSpace(example.Answer)
+
+	if example.AnswerOnly {
+		empty, _, err := assistantTurn(opts, prompt, endOfTurn, "an empty assistant turn", Example{ID: example.ID, Messages: example.Messages})
+		if err != nil {
+			return Text{}, err
+		}
+		opening := strings.TrimSuffix(empty, endOfTurn)
+		written, ok := strings.CutPrefix(completion, opening)
+		if !ok {
+			return Text{}, fmt.Errorf("trajectory %q: the answer-only turn does not open with %q, what the template writes before an empty answer: it opens %q",
+				example.ID, opening, excerpt(completion, 0))
+		}
+		if written = strings.TrimSuffix(written, endOfTurn); strings.TrimSpace(written) != answer {
+			return Text{}, fmt.Errorf("trajectory %q: the answer-only turn holds %q after its opening, want the answer %q and nothing else",
+				example.ID, excerpt(written, 0), excerpt(answer, 0))
+		}
+		return text, nil
+	}
+
+	reasoning := strings.TrimSpace(example.Reasoning)
+	at := strings.Index(completion, reasoning)
+	if at < 0 {
+		return Text{}, fmt.Errorf("trajectory %q: the template dropped the reasoning from the assistant's turn", example.ID)
+	}
+	if !strings.Contains(completion[at+len(reasoning):], answer) {
+		return Text{}, fmt.Errorf("trajectory %q: the assistant's turn does not hold the answer after the reasoning", example.ID)
+	}
+	return text, nil
+}
+
+// assistantTurn renders example's messages followed by an assistant turn of
+// its Reasoning and Answer, without the generation prompt, and returns what
+// that render adds after prompt: the completion, through its one endOfTurn,
+// and the tail after it. turn names the assistant turn in an error.
+func assistantTurn(opts llama.ChatOptions, prompt, endOfTurn, turn string, example Example) (completion, tail string, err error) {
 	conversation := append(slices.Clone(example.Messages), llama.ChatMessage{
 		Role:             "assistant",
 		Content:          example.Answer,
@@ -127,31 +199,22 @@ func Render(chatTemplate, endOfTurn string, example Example) (Text, error) {
 	opts.AddGenerationPrompt = llama.Bool(false)
 	full, err := llama.RenderChatTemplate(conversation, opts)
 	if err != nil {
-		return Text{}, fmt.Errorf("trajectory %q: rendering the conversation: %w", example.ID, err)
+		return "", "", fmt.Errorf("trajectory %q: rendering the conversation with %s: %w", example.ID, turn, err)
 	}
 	if !strings.HasPrefix(full, prompt) {
 		at := 0
 		for at < len(full) && at < len(prompt) && full[at] == prompt[at] {
 			at++
 		}
-		return Text{}, fmt.Errorf("trajectory %q: the conversation with the assistant's turn does not begin with the prompt: they part at byte %d, prompt %q, conversation %q",
-			example.ID, at, excerpt(prompt, at), excerpt(full, at))
+		return "", "", fmt.Errorf("trajectory %q: the conversation with %s does not begin with the prompt: they part at byte %d, prompt %q, conversation %q",
+			example.ID, turn, at, excerpt(prompt, at), excerpt(full, at))
 	}
 	rest := full[len(prompt):]
 	if n := strings.Count(rest, endOfTurn); n != 1 {
-		return Text{}, fmt.Errorf("trajectory %q: the assistant's turn holds the end of turn %q %d times, want once", example.ID, endOfTurn, n)
+		return "", "", fmt.Errorf("trajectory %q: %s holds the end of turn %q %d times, want once", example.ID, turn, endOfTurn, n)
 	}
 	end := strings.Index(rest, endOfTurn) + len(endOfTurn)
-	completion := rest[:end]
-	reasoning, answer := strings.TrimSpace(example.Reasoning), strings.TrimSpace(example.Answer)
-	at := strings.Index(completion, reasoning)
-	if at < 0 {
-		return Text{}, fmt.Errorf("trajectory %q: the template dropped the reasoning from the assistant's turn", example.ID)
-	}
-	if !strings.Contains(completion[at+len(reasoning):], answer) {
-		return Text{}, fmt.Errorf("trajectory %q: the assistant's turn does not hold the answer after the reasoning", example.ID)
-	}
-	return Text{Prompt: prompt, Completion: completion, Tail: rest[end:]}, nil
+	return rest[:end], rest[end:], nil
 }
 
 // Build renders example for student with Render and tokenizes it into a Row.
@@ -221,9 +284,13 @@ func Build(ctx context.Context, student Student, example Example) (Row, Report, 
 
 // validate refuses what cannot become a row whatever the template: a row the
 // curriculum cannot name, a conversation that does not end with the question,
-// and an empty reasoning or answer. The Ornith's template trims either to
-// nothing, and the row would teach the student an empty thinking block or an
-// empty reply -- the one thing a verified trajectory was chosen not to be.
+// an empty answer, and a reasoning at odds with the level the example
+// declares. The Ornith's template trims either text to nothing, and the row
+// would teach the student an empty reply, or an empty thinking block -- the
+// one thing a verified trajectory was chosen not to be, and what an AnswerOnly
+// row teaches on purpose. So an empty reasoning is refused unless the example
+// declares AnswerOnly, and a reasoning is refused when it does: that row would
+// be a trajectory under the other level's name.
 func (e Example) validate() error {
 	if e.ID == "" {
 		return errors.New("trajectory: no ID")
@@ -234,8 +301,11 @@ func (e Example) validate() error {
 	if last := e.Messages[len(e.Messages)-1].Role; last != "user" {
 		return fmt.Errorf("trajectory %q: the conversation ends with a %q turn, want the user's question", e.ID, last)
 	}
-	if strings.TrimSpace(e.Reasoning) == "" {
-		return fmt.Errorf("trajectory %q: empty reasoning", e.ID)
+	if e.AnswerOnly && e.Reasoning != "" {
+		return fmt.Errorf("trajectory %q: reasoning in an answer-only example, which carries no trajectory", e.ID)
+	}
+	if !e.AnswerOnly && strings.TrimSpace(e.Reasoning) == "" {
+		return fmt.Errorf("trajectory %q: empty reasoning in an example that does not declare AnswerOnly", e.ID)
 	}
 	if strings.TrimSpace(e.Answer) == "" {
 		return fmt.Errorf("trajectory %q: empty answer", e.ID)
