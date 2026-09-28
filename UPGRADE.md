@@ -22,6 +22,18 @@ render, the reasoning parse and the generation parameters changed under
 unchanged symbol names. An archive built before this release links against
 the new Go code without error and receives misplaced arguments.
 
+Existing recipes, mappings and caches do not change. To distil:
+1. Measure both tokenizers.
+2. Build the mapping with `fusioncache.VocabularyMapping`, and set each
+   `ModelIdentity.TokenizerSHA256` to the measured `SourceSHA256`. For a GGUF
+   that is the metadata digest.
+3. Produce one cache per teacher over every curriculum row, in order: role
+   `train`, no features, and `TeacherTokens == StudentTokens == input_ids`.
+4. Declare `Recipe.Distillation` and pass the cache directory.
+
+A distillation recipe cannot continue a checkpoint written under another
+recipe; start fresh.
+
 Model identities now belong to private installation configuration. Construct
 `NewMXCatalog` from typed `MXModelIdentity` entries and pass the selected identity
 in `MXConfig.Model`. Repository, revision, manifest, quantisation and shard

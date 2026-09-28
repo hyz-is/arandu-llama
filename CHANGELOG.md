@@ -46,6 +46,19 @@ a release is corrected by another release and never by moving a tag.
   exact or lower bound. Mass is conserved: the cells plus the residual, stop,
   special and uncovered mass sum to one. It is not wired to `fusioncache` or
   to training.
+- `training/tokenizer` measures a vocabulary from a `tokenizer.json` or from
+  GGUF metadata without reading tensors (`ReadVocabularyJSON`,
+  `ReadVocabularyGGUF`, `Vocabulary.Digest`, `SameVocabulary`).
+  `training/fusioncache` admits an identity mapping over a measured identical
+  vocabulary with a declared common id range (`TokenMapping.Vocabulary`,
+  `VocabularyMapping`, `ValidateMapping`). A gold or teacher token outside the
+  range refuses the cache.
+- `training/local` takes an optional `Recipe.Distillation`: teacher-forced
+  logit distillation through `FusionCompletionGradient`, under the same AdamW,
+  checkpoints and stage, with `Config.CacheDir` and
+  `StageConfig.CacheDirectory`. When alpha is above zero, step manifests gain
+  `distillation_loss_before`, `teacher_mass` and `teacher_losses`. Recipes,
+  mappings and manifests without these fields keep their digests and bytes.
 
 ### Fixed
 

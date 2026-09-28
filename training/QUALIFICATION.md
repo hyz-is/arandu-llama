@@ -16,6 +16,12 @@ entire numerical recipe. Historical checkpoints need caller-admitted manifest
 hashes before they can be resumed. This executor does not implement the complete
 multi-teacher pipeline or establish a quality improvement.
 
+`training/local` can blend into each step the teacher-forced top-k
+distributions of teachers that share the student's measured vocabulary. CPU
+fixtures check two things: the blend against an independent trajectory, and
+alpha zero against SFT bit for bit. They do not qualify teacher caches, model
+quality or a real run.
+
 Native primitives use the optional LibTorch bridge. No Python interpreter is
 required. Builds without the native backend can inspect persisted state but
 refuse tensor execution. The caller supplies compatible headers and libraries
