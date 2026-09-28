@@ -27,6 +27,17 @@ a release is corrected by another release and never by moving a tag.
   `ReasoningContent` without a model, the way `Chat` does. `ChatResponse` gains
   `Output`, `FinishReason` (`FinishReasonStop`, `FinishReasonLength`) and
   `GeneratedTokens`, counted in the generation loop. `ChatOptions` gains `MinP`.
+- `ChatMessage.ReasoningContent` hands an assistant turn's thinking to the
+  template as `reasoning_content`; an empty value renders the message as
+  before. `ChatOptions.AddGenerationPrompt` set to false renders a conversation
+  that ends with its last message, as a training row needs; `Chat`,
+  `ChatStream` and `ParseChatOutput` refuse it.
+- `training/trajectory` turns a verified teacher trajectory (question,
+  reasoning, answer) into the row `training/local` reads. The student's own
+  template renders the prompt with thinking on and the completion through the
+  end of turn, and the student's tokenizer encodes both, with -100 labels over
+  the prompt. `Report.JointAgrees` says whether encoding the whole text agrees
+  with the prompt-then-completion boundary.
 
 ### Fixed
 

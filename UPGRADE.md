@@ -17,6 +17,11 @@ return text: a parse failure, a decode failure or a cancelled context is an
 error. Check `FinishReason` before treating `Content` as an answer; with
 `FinishReasonLength` it may be empty. `ReasoningFormatNone` is unchanged.
 
+Rebuild `libbinding.a` after upgrading. The internal C signatures of the chat
+render, the reasoning parse and the generation parameters changed under
+unchanged symbol names. An archive built before this release links against
+the new Go code without error and receives misplaced arguments.
+
 Model identities now belong to private installation configuration. Construct
 `NewMXCatalog` from typed `MXModelIdentity` entries and pass the selected identity
 in `MXConfig.Model`. Repository, revision, manifest, quantisation and shard
