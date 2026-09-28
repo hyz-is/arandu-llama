@@ -166,12 +166,9 @@ func DecoderVJP(ctx context.Context, x *torch.Tensor, weights DecoderWeights, ad
 		*a, _ = s.result(pairGradients[2*i])
 		*b, _ = s.result(pairGradients[2*i+1])
 	}
-	for _, gradient := range []*torch.Tensor{result.Input} {
-		finite, err := gradient.AllFinite()
-		if err != nil || !finite {
-			_ = result.Close()
-			return nil, errors.Join(errors.New("layers: non-finite decoder gradient"), err)
-		}
+	if finite, err := result.Input.AllFinite(); err != nil || !finite {
+		_ = result.Close()
+		return nil, errors.Join(errors.New("layers: non-finite decoder gradient"), err)
 	}
 	for _, target := range adapter.Targets() {
 		a, b := result.Pair(target)
