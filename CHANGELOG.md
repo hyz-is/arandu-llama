@@ -97,6 +97,19 @@ a release is corrected by another release and never by moving a tag.
 
   `DrawFromLogits` and `RolloutUniforms` run the same arithmetic on a supplied
   logit row.
+- `training/router` is the TCAP teacher router. Both entry points work from a
+  `Config` pinned by its canonical digest:
+  - `Route` chooses at most k teachers for an example before any of them
+    generates.
+  - `Shortlist` keeps a per-capability shortlist offline.
+
+  License, pinned artifact, qualification and a measured competence cell are
+  gates: a teacher that fails one is excluded with the reasons recorded.
+  Selection is sequential, with lineage redundancy conditional on the teachers
+  already chosen; ties go to the lower id, and a weight that underflows is
+  refused. The serializable `Decision` carries the order, each round's
+  standings, the factors, the softmax weights and the configuration and input
+  digests. No entry point accepts a teacher output.
 
 ### Fixed
 
