@@ -73,6 +73,7 @@ func DecoderForward(ctx context.Context, x *torch.Tensor, weights DecoderWeights
 // graph, and recurrent pairs through the same explicit VJP as the input.
 // Inputs and parameters remain caller-owned and are not changed.
 func DecoderVJP(ctx context.Context, x *torch.Tensor, weights DecoderWeights, adapter *AttentionLoRA, cosine, sine, cotangent *torch.Tensor, config DecoderConfig) (*DecoderGradients, error) {
+	defer lockGraphThread()()
 	if err := decoderValidate(ctx, x, weights, adapter, config); err != nil {
 		return nil, err
 	}

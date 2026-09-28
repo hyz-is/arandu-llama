@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 
 	"github.com/tayi-ai/arandu-llama/training/layers"
 	"github.com/tayi-ai/arandu-llama/training/torch"
@@ -207,6 +208,10 @@ func (m *TextModel) validateSnapshot(ctx context.Context, snapshot *Snapshot, lo
 }
 
 func (m *TextModel) vjp(ctx context.Context, snapshot *Snapshot, logitCotangent *torch.Tensor, features map[int][]featureCotangent) (_ Gradients, err error) {
+	// The head graph is built and differentiated here; like every decoder VJP
+	// it stays on one OS thread, so its gradient order is the creation order.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := m.validateSnapshot(ctx, snapshot, logitCotangent); err != nil {
 		return nil, err
 	}

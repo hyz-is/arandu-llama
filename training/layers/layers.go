@@ -5,6 +5,7 @@ package layers
 import (
 	"errors"
 	"math"
+	"runtime"
 
 	"github.com/tayi-ai/arandu-llama/training/torch"
 )
@@ -249,6 +250,16 @@ func feedForwardPromoted(x, gateWeight, upWeight, downWeight *torch.Tensor, adap
 	product := s.run(func() (*torch.Tensor, error) { return gate.Mul(up) })
 	result := s.run(func() (*torch.Tensor, error) { return project(product, downBase, pairs.DownA, pairs.DownB, alpha) })
 	return s.result(result)
+}
+
+// lockGraphThread keeps a graph and its backward on one OS thread until the
+// returned release runs. LibTorch numbers autograd nodes with a per-thread
+// counter and accumulates gradients in that order; a goroutine that moves
+// between threads across native calls would reorder the sums run to run by a
+// few ULPs. Locks nest, so a caller may already hold one.
+func lockGraphThread() func() {
+	runtime.LockOSThread()
+	return runtime.UnlockOSThread
 }
 
 func positiveFinite(value float64) bool {

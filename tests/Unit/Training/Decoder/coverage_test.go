@@ -286,3 +286,57 @@ func TestFullCoverageReplaceAndRestoreInstallEveryPair(t *testing.T) {
 		}
 	}
 }
+
+// Every VJP keeps its graph on one OS thread, so gradient accumulation follows
+// creation order and repeats are bitwise equal even when each repeat starts on
+// a fresh goroutine. Before that, a goroutine moving between threads reordered
+// the sums and a few repeats in sixty moved gradients by a few ULPs.
+func TestVJPIsBitwiseReproducibleAcrossGoroutines(t *testing.T) {
+	for name, build := range map[string]func(*testing.T) *fixture{
+		"q_v":  func(t *testing.T) *fixture { return newFixture(t, torch.Float32) },
+		"full": func(t *testing.T) *fixture { return newCoverageFixture(t, 0.1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := build(t)
+			snapshot := forward(t, f)
+			seed := tensor(t, f.seed, []int64{1, 2, 6}, false)
+			var first [][]float32
+			for repeat := 0; repeat < 60; repeat++ {
+				done := make(chan [][]float32)
+				go func() {
+					gradients, err := f.model.VJP(context.Background(), snapshot, seed)
+					if err != nil {
+						t.Error(err)
+						done <- nil
+						return
+					}
+					var values [][]float32
+					for _, gradient := range gradients {
+						data, err := gradient.Value.Float32Values()
+						if err != nil {
+							t.Error(err)
+						}
+						values = append(values, data)
+					}
+					_ = gradients.Close()
+					done <- values
+				}()
+				values := <-done
+				if values == nil {
+					t.FailNow()
+				}
+				if repeat == 0 {
+					first = values
+					continue
+				}
+				for i := range values {
+					for j := range values[i] {
+						if math.Float32bits(values[i][j]) != math.Float32bits(first[i][j]) {
+							t.Fatalf("repeat %d gradient %d element %d: %.9g != %.9g", repeat, i, j, values[i][j], first[i][j])
+						}
+					}
+				}
+			}
+		})
+	}
+}

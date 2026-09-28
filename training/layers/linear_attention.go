@@ -103,6 +103,7 @@ func LinearAttentionVJP(ctx context.Context, x *torch.Tensor, weights LinearAtte
 // linearAttentionVJP also returns the cotangent of every adapted pair, laid
 // out like the adapter. The caller owns every returned handle.
 func linearAttentionVJP(ctx context.Context, x *torch.Tensor, weights LinearAttentionWeights, pairs linearPairs, dy *torch.Tensor, config LinearAttentionConfig) (*torch.Tensor, LinearAttentionLoRA, error) {
+	defer lockGraphThread()()
 	var adapted LinearAttentionLoRA
 	if dy == nil {
 		return nil, adapted, errors.New("layers: linear attention VJP requires a cotangent")

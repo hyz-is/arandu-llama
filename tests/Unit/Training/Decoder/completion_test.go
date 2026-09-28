@@ -222,10 +222,8 @@ func adapterValues(t *testing.T, f *fixture) [][]float32 {
 	return out
 }
 
-// VJP on this fixture is not bitwise reproducible run to run on CPU: on the
-// code before the split, 3 of 60 repeats moved layer 3's adapter gradients by
-// a few float32 ULPs, with OMP_NUM_THREADS=1 as well. The loss comes from the
-// forward alone and is held bitwise; the gradients use the scaled tolerance.
+// Each VJP keeps its graph on one OS thread, so both the loss and the
+// gradients are held bitwise.
 func TestCompletionGradientIsTheVJPOfThePreSplitCotangent(t *testing.T) {
 	f := newFixture(t, torch.Float32)
 	ctx := context.Background()
@@ -263,7 +261,7 @@ func TestCompletionGradientIsTheVJPOfThePreSplitCotangent(t *testing.T) {
 				t.Fatalf("scale %g gradient %d identity differs", scale, i)
 			}
 			for j := range want {
-				if math.Abs(float64(got[j])-float64(want[j])) > 1e-6+1e-5*math.Abs(float64(want[j])) {
+				if math.Float32bits(got[j]) != math.Float32bits(want[j]) {
 					t.Fatalf("scale %g gradient %s[%d] %.9g != pre-split %.9g", scale, gradient.Name, j, got[j], want[j])
 				}
 			}
