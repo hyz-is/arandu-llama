@@ -138,7 +138,7 @@ func produce(ctx context.Context, p Producer, e Expectation, l Limits) (Cache, e
 			}
 			row := Position{TargetIndex: position, TeacherPrefixSHA256: prefix, StudentPrefixSHA256: PrefixDigest(x.StudentTokens[:position]), RetainedMass: signal.RetainedMass}
 			for _, probability := range signal.Probabilities {
-				student, ok := mappedToken(e.Mapping.Identity, table, probability.TokenID)
+				student, ok := mappedToken(table, probability.TokenID)
 				if !ok {
 					return Cache{}, fmt.Errorf("%w: unmapped teacher distribution token", ErrContract)
 				}

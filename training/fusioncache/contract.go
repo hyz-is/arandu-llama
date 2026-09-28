@@ -13,6 +13,8 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+
+	"github.com/tayi-ai/arandu-llama/training/tokenizer"
 )
 
 // ErrContract identifies a cache or projection that violates its declared contract.
@@ -38,12 +40,56 @@ type TokenPair struct {
 // TokenMapping permits identical tokenizers or a pinned bijection of the tokens
 // used by the cache. EvidenceSHA256 identifies external token-byte/template
 // equivalence qualification. Different position counts are refused.
+//
+// An identity mapping without Vocabulary requires one tokenizer file on both
+// sides and equal vocabulary sizes. With Vocabulary it admits two tokenizer
+// artifacts whose files differ but whose measured vocabularies agree, and
+// every token it maps must lie below Vocabulary.CommonTokens. An absent
+// Vocabulary is not encoded, so every earlier mapping keeps its digest.
 type TokenMapping struct {
-	TeacherTokenizerSHA256 string      `json:"teacher_tokenizer_sha256"`
-	StudentTokenizerSHA256 string      `json:"student_tokenizer_sha256"`
-	Identity               bool        `json:"identity"`
-	Pairs                  []TokenPair `json:"pairs,omitempty"`
-	EvidenceSHA256         string      `json:"evidence_sha256"`
+	TeacherTokenizerSHA256 string              `json:"teacher_tokenizer_sha256"`
+	StudentTokenizerSHA256 string              `json:"student_tokenizer_sha256"`
+	Identity               bool                `json:"identity"`
+	Pairs                  []TokenPair         `json:"pairs,omitempty"`
+	EvidenceSHA256         string              `json:"evidence_sha256"`
+	Vocabulary             *VocabularyIdentity `json:"vocabulary,omitempty"`
+}
+
+// VocabularyIdentity records that the teacher's and the student's tokenizer
+// artifacts were measured to declare the same token at every id below
+// CommonTokens and the same merges in the same order. SHA256 is that shared
+// digest under Algorithm, which is tokenizer.VocabularyAlgorithm.
+//
+// The common range is how two vocabularies of different lengths are compared.
+// A GGUF pads its token list up to the model's embedding rows with [PAD…]
+// tokens, and one tokenizer.json may declare tokens another lacks; neither
+// tail is compared. So no id at or above CommonTokens is admitted anywhere: a
+// gold token or a teacher top-k token there refuses the cache, whose mass is
+// never dropped or renormalized.
+type VocabularyIdentity struct {
+	Algorithm    string `json:"algorithm"`
+	CommonTokens int    `json:"common_tokens"`
+	SHA256       string `json:"sha256"`
+}
+
+// VocabularyMapping measures the identity mapping between two tokenizer
+// artifacts, refusing unless their vocabularies agree on ids
+// [0, commonTokens) and on every merge. The mapping names each side's
+// tokenizer by the SHA-256 of the bytes its measurement read, so the teacher's
+// and student's ModelIdentity.TokenizerSHA256 must be those same digests for
+// the mapping to be admitted. For a GGUF that is the digest of its metadata.
+func VocabularyMapping(teacher, student tokenizer.Vocabulary, commonTokens int, evidenceSHA256 string) (TokenMapping, error) {
+	if !validSHA(teacher.SourceSHA256) || !validSHA(student.SourceSHA256) || !validSHA(evidenceSHA256) || commonTokens < 2 {
+		return TokenMapping{}, fmt.Errorf("%w: measured sources, evidence and a common range of two ids or more required", ErrContract)
+	}
+	digest, err := tokenizer.SameVocabulary(teacher, student, commonTokens)
+	if err != nil {
+		return TokenMapping{}, fmt.Errorf("%w: %w", ErrContract, err)
+	}
+	return TokenMapping{
+		TeacherTokenizerSHA256: teacher.SourceSHA256, StudentTokenizerSHA256: student.SourceSHA256, Identity: true, EvidenceSHA256: evidenceSHA256,
+		Vocabulary: &VocabularyIdentity{Algorithm: tokenizer.VocabularyAlgorithm, CommonTokens: commonTokens, SHA256: digest},
+	}, nil
 }
 
 // Example contains a prompt followed by its admitted gold completion in both
@@ -181,46 +227,77 @@ func validateLimits(l Limits) error {
 	return nil
 }
 
-func mappingTable(e Expectation, l Limits) (map[int64]int64, error) {
+// tokenSpace is an admitted mapping: the identity below limit, or a table.
+type tokenSpace struct {
+	identity bool
+	limit    int64
+	table    map[int64]int64
+}
+
+func mappingTable(e Expectation, l Limits) (tokenSpace, error) {
 	m := e.Mapping
 	if len(m.Pairs) > l.MaxMappingPairs || (m.Identity && len(m.Pairs) != 0) {
-		return nil, fmt.Errorf("%w: mapping size exceeds bound", ErrContract)
+		return tokenSpace{}, fmt.Errorf("%w: mapping size exceeds bound", ErrContract)
 	}
 	digest, err := Digest(m)
 	if err != nil || !validSHA(e.MappingSHA256) || digest != e.MappingSHA256 || !validSHA(m.EvidenceSHA256) || m.TeacherTokenizerSHA256 != e.Teacher.TokenizerSHA256 || m.StudentTokenizerSHA256 != e.Student.TokenizerSHA256 {
-		return nil, fmt.Errorf("%w: mapping identity differs", ErrContract)
+		return tokenSpace{}, fmt.Errorf("%w: mapping identity differs", ErrContract)
+	}
+	if v := m.Vocabulary; v != nil {
+		if !m.Identity || v.Algorithm != tokenizer.VocabularyAlgorithm || !validSHA(v.SHA256) || v.CommonTokens < 2 || v.CommonTokens > e.Teacher.Vocabulary || v.CommonTokens > e.Student.Vocabulary {
+			return tokenSpace{}, fmt.Errorf("%w: measured vocabulary identity differs", ErrContract)
+		}
+		return tokenSpace{identity: true, limit: int64(v.CommonTokens)}, nil
 	}
 	if m.Identity {
 		if m.TeacherTokenizerSHA256 != m.StudentTokenizerSHA256 || e.Teacher.Vocabulary != e.Student.Vocabulary || len(m.Pairs) != 0 {
-			return nil, fmt.Errorf("%w: identity mapping differs", ErrContract)
+			return tokenSpace{}, fmt.Errorf("%w: identity mapping differs", ErrContract)
 		}
-		return nil, nil
+		return tokenSpace{identity: true, limit: int64(e.Teacher.Vocabulary)}, nil
 	}
 	if len(m.Pairs) == 0 || len(m.Pairs) > l.MaxMappingPairs {
-		return nil, fmt.Errorf("%w: mapping size exceeds bound", ErrContract)
+		return tokenSpace{}, fmt.Errorf("%w: mapping size exceeds bound", ErrContract)
 	}
 	table := make(map[int64]int64, len(m.Pairs))
 	students := make(map[int64]bool, len(m.Pairs))
 	for index, pair := range m.Pairs {
 		if pair.Teacher < 0 || pair.Teacher >= int64(e.Teacher.Vocabulary) || pair.Student < 0 || pair.Student >= int64(e.Student.Vocabulary) || students[pair.Student] || (index > 0 && pair.Teacher <= m.Pairs[index-1].Teacher) {
-			return nil, fmt.Errorf("%w: mapping must be ordered and one-to-one", ErrContract)
+			return tokenSpace{}, fmt.Errorf("%w: mapping must be ordered and one-to-one", ErrContract)
 		}
 		table[pair.Teacher], students[pair.Student] = pair.Student, true
 	}
-	return table, nil
+	return tokenSpace{table: table}, nil
 }
 
-func mappedToken(identity bool, table map[int64]int64, token int64) (int64, bool) {
-	if identity {
-		return token, true
+// mappedToken refuses an identity token outside the admitted range. Without a
+// measured vocabulary that range is the teacher's whole vocabulary, which the
+// callers already bound, so plain identity mappings behave as before.
+func mappedToken(space tokenSpace, token int64) (int64, bool) {
+	if space.identity {
+		return token, token >= 0 && token < space.limit
 	}
-	v, ok := table[token]
+	v, ok := space.table[token]
 	return v, ok
 }
 
 func sameMapping(a, b TokenMapping) bool {
 	return a.Identity == b.Identity && a.TeacherTokenizerSHA256 == b.TeacherTokenizerSHA256 &&
-		a.StudentTokenizerSHA256 == b.StudentTokenizerSHA256 && a.EvidenceSHA256 == b.EvidenceSHA256 && slices.Equal(a.Pairs, b.Pairs)
+		a.StudentTokenizerSHA256 == b.StudentTokenizerSHA256 && a.EvidenceSHA256 == b.EvidenceSHA256 && slices.Equal(a.Pairs, b.Pairs) &&
+		(a.Vocabulary == nil) == (b.Vocabulary == nil) && (a.Vocabulary == nil || *a.Vocabulary == *b.Vocabulary)
+}
+
+// ValidateMapping checks two model identities and the mapping between them
+// without any example, so a caller that names a teacher can be refused before
+// its cache is read. ValidateExpectation applies the same checks.
+func ValidateMapping(teacher, student ModelIdentity, mapping TokenMapping, mappingSHA256 string, l Limits) error {
+	if err := validateLimits(l); err != nil {
+		return err
+	}
+	if !validModel(teacher) || !validModel(student) {
+		return fmt.Errorf("%w: invalid models", ErrContract)
+	}
+	_, err := mappingTable(Expectation{Teacher: teacher, Student: student, Mapping: mapping, MappingSHA256: mappingSHA256}, l)
+	return err
 }
 
 // ValidateExpectation refuses ambiguous alignment and nontraining data before a
@@ -259,7 +336,7 @@ func ValidateExpectation(e Expectation, l Limits) error {
 		positions += count - x.PromptTokens
 		seen[exampleKey(x)] = true
 		for i, teacher := range x.TeacherTokens {
-			student, ok := mappedToken(e.Mapping.Identity, table, teacher)
+			student, ok := mappedToken(table, teacher)
 			if teacher < 0 || teacher >= int64(e.Teacher.Vocabulary) || !ok || student != x.StudentTokens[i] || student < 0 || student >= int64(e.Student.Vocabulary) {
 				return fmt.Errorf("%w: gold prefix token mapping differs", ErrContract)
 			}
@@ -299,7 +376,7 @@ func ValidateAgainstStudent(c Cache, e Expectation, l Limits) error {
 			}
 			sum := 0.0
 			for j, probability := range p.Probabilities {
-				student, ok := mappedToken(e.Mapping.Identity, table, probability.TeacherTokenID)
+				student, ok := mappedToken(table, probability.TeacherTokenID)
 				if !ok || student != probability.StudentTokenID || probability.TeacherTokenID < 0 || probability.TeacherTokenID >= int64(e.Teacher.Vocabulary) || student < 0 || student >= int64(e.Student.Vocabulary) || !finite(probability.Probability) || probability.Probability < 0 || probability.Probability > 1 || (j > 0 && probability.TeacherTokenID <= p.Probabilities[j-1].TeacherTokenID) {
 					return fmt.Errorf("%w: mapped probability invalid or unordered", ErrContract)
 				}
