@@ -17,6 +17,17 @@ a release is corrected by another release and never by moving a tag.
   from.
 - `decoder.CompletionLoss` and `local.MeasureLosses` read the completion loss
   of existing checkpoints without computing a gradient.
+- `decoder.AdapterCoverage` declares which projections carry a LoRA pair, by
+  layer kind: full attention, the linear-attention (DeltaNet) projections and
+  the MLP of every layer. `FullAdapterCoverage` declares all of them, and
+  `DeriveInitialReference` derives the initial adapter reference for a declared
+  coverage. A nil coverage keeps `q_proj` and `v_proj` of the full-attention
+  layers with every earlier digest unchanged.
+
+### Fixed
+
+- Each training backward runs on one OS thread, so a local SFT step on the CPU
+  repeats bit for bit.
 
 ### Changed
 
