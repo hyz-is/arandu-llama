@@ -306,6 +306,9 @@ wrapper.o: wrapper.cpp wrapper.h
 wrapper_adapter.o: wrapper_adapter.cpp wrapper.h
 	$(CXX) $(CXXFLAGS) -I./llama.cpp -I./llama.cpp/common -I./llama.cpp/ggml/include -I./llama.cpp/include wrapper_adapter.cpp -o wrapper_adapter.o -c $(LDFLAGS)
 
+wrapper_rollout.o: wrapper_rollout.cpp wrapper.h
+	$(CXX) $(CXXFLAGS) -I./llama.cpp -I./llama.cpp/common -I./llama.cpp/ggml/include -I./llama.cpp/include wrapper_rollout.cpp -o wrapper_rollout.o -c $(LDFLAGS)
+
 # Vendored llama.cpp headers. Consumers fetching this repo through the Go module
 # proxy don't get the llama.cpp git submodule, so wrapper.cpp's #include
 # "llama.cpp/..." paths fail to resolve at their build time. We mirror the small
@@ -339,9 +342,9 @@ vendor-headers cgo_headers/.vendored:
 
 # All Go bindings are now handled through wrapper.cpp
 
-libbinding.a: cgo_headers/.vendored llama.cpp/ggml.o wrapper.o wrapper_adapter.o $(EXTRA_TARGETS)
+libbinding.a: cgo_headers/.vendored llama.cpp/ggml.o wrapper.o wrapper_adapter.o wrapper_rollout.o $(EXTRA_TARGETS)
 	cd build && cmake --build . --target llama-common
-	ar crs libbinding.a wrapper.o wrapper_adapter.o $(EXTRA_TARGETS)
+	ar crs libbinding.a wrapper.o wrapper_adapter.o wrapper_rollout.o $(EXTRA_TARGETS)
 ifeq ($(BUILD_LINKAGE),static)
 	@echo "Copying static libraries (BUILD_LINKAGE=static)..."
 	cp $(COMMON_STATIC_LIBS) .

@@ -431,6 +431,65 @@ int llama_wrapper_capture_teacher(void* model, const char* tensor,
                                   long long max_window_bytes, int* out_ids, double* out_probabilities,
                                   long long top_elements, double* out_mass, float* out_features, long long feature_elements);
 
+// Rollouts: sampling that records, per token, the log probability of the token
+// under the distribution it was drawn from. Implemented in wrapper_rollout.cpp.
+//
+// The distribution of one position, with l the n_vocab float logits llama.cpp
+// returns for it and every quantity below in double:
+//
+//   z_i   = l_i / temperature
+//   order = token ids by descending z, ascending id among equal z
+//   w_i   = exp(z_i - max z)
+//   K     = the first top_k ids of order when 0 < top_k < n_vocab, else all
+//   P     = when top_p < 1, the shortest prefix of order within K whose summed
+//           w reaches top_p * (sum of w over K), else K
+//   S     = when min_p > 0, the ids of P with w_i >= min_p, else P
+//   log mu(i) = (z_i - max z) - log(sum of w over S) for i in S, -inf otherwise
+//
+// Sums over a set run in ascending token id; the top_p prefix sum runs in
+// order. The draw takes the uniform u in [0, 1) and returns the first id of S,
+// in ascending id, whose running sum of w exceeds u * (sum of w over S), or the
+// last id of S with w > 0 when rounding put u * sum on the final sum.
+//
+// At temperature 1 with top_k 0, top_p 1 and min_p 0, S is the vocabulary and
+// log mu is the log-softmax of the logits.
+typedef struct {
+    float temperature;  // finite, > 0
+    int top_k;          // 0 disables; otherwise >= 1
+    float top_p;        // (0, 1]; 1 disables
+    float min_p;        // [0, 1); 0 disables
+} llama_wrapper_rollout_sampling;
+
+// Sample a rollout from an empty KV cache under the adapters applied to ctx.
+// The prompt is decoded from position 0 (no prefix reuse), then up to
+// max_tokens tokens are sampled, the i-th from the i-th uniform of mt19937_64
+// seeded with seed. out_tokens and out_log_mu (capacity entries each) receive
+// the sampled ids, the end-of-generation token included when one ended the
+// rollout, and log mu of each. out_stop_reason is LLAMA_WRAPPER_STOP_EOG or
+// LLAMA_WRAPPER_STOP_LENGTH on success. A failed decode returns -1 with
+// LLAMA_WRAPPER_STOP_DECODE_FAILED and the count sampled before it. The prompt
+// plus max_tokens must fit the context. Returns 0, or -1 with
+// llama_wrapper_last_error set; the three counters are written on every return.
+int llama_wrapper_rollout(void* ctx, const int* prompt, int n_prompt,
+                          llama_wrapper_rollout_sampling sampling, unsigned long long seed, int max_tokens,
+                          int* out_tokens, double* out_log_mu, int capacity,
+                          int* out_generated, int* out_stop_reason, int* out_prompt_decoded);
+
+// One position of the procedure above on a supplied logit row, with the
+// uniform given rather than drawn. No model is involved. out_log_mu_all may be
+// NULL; otherwise it receives n_vocab entries, -inf outside S. Returns 0, or -1
+// with llama_wrapper_last_error set.
+int llama_wrapper_rollout_draw(const float* logits, int n_vocab, llama_wrapper_rollout_sampling sampling,
+                               double u, int* out_token, double* out_log_mu, double* out_log_mu_all);
+
+// The first n uniforms a rollout seeded with seed draws, one per position:
+// (x >> 11) * 2^-53 for each 64-bit output x of mt19937_64(seed).
+int llama_wrapper_rollout_uniforms(unsigned long long seed, int n, double* out);
+
+// 1 when token ends generation for the model of ctx, 0 when it does not, -1 on
+// error (null context, token outside the vocabulary).
+int llama_wrapper_rollout_is_eog(void* ctx, int token);
+
 #ifdef __cplusplus
 }
 #endif
