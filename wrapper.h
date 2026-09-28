@@ -84,7 +84,33 @@ typedef struct {
     int n_prev;
     int n_probs;
     bool ignore_eos;
+
+    // Optional outputs, written when not NULL and ignored otherwise; see
+    // llama_wrapper_stop_reason. They are written on every return, a failed
+    // one included, so a caller never reads what an earlier call left.
+    int* n_generated_out;  // tokens whose pieces make up the returned text
+    int* stop_reason_out;  // a llama_wrapper_stop_reason
 } llama_wrapper_generate_params;
+
+// Why a generation loop returned. The returned text alone cannot say: an
+// answer cut at the token ceiling, one that ended with the model's own
+// end-of-generation token and one abandoned after a failed decode are all a
+// string.
+//
+// The plain loop (llama_wrapper_generate, llama_wrapper_generate_with_tokens)
+// reports every reason exactly. The speculative loop reports EOG, STOP_WORD,
+// CALLBACK and DECODE_FAILED exactly and UNKNOWN otherwise: its ceiling is
+// compared against the length of the text in bytes rather than a token count,
+// so reaching it is not "max_tokens reached", and an empty verification is not
+// any of the others. Its n_generated_out is exact.
+typedef enum {
+    LLAMA_WRAPPER_STOP_UNKNOWN = 0,
+    LLAMA_WRAPPER_STOP_EOG = 1,            // the model sampled an end-of-generation token
+    LLAMA_WRAPPER_STOP_WORD = 2,           // the text contains one of stop_words
+    LLAMA_WRAPPER_STOP_CALLBACK = 3,       // the token callback returned false
+    LLAMA_WRAPPER_STOP_LENGTH = 4,         // max_tokens tokens were generated (128 when it is 0)
+    LLAMA_WRAPPER_STOP_DECODE_FAILED = 5   // llama_decode failed on a sampled token
+} llama_wrapper_stop_reason;
 
 // Callback for streaming tokens
 typedef bool (*llama_wrapper_token_callback)(const char* token);

@@ -559,8 +559,35 @@ func findCommonPrefix(a, b []int32) int {
 	return commonLen
 }
 
+// generationStop is llama_wrapper_stop_reason: why the wrapper's generation
+// loop returned.
+type generationStop int
+
+const (
+	generationStopUnknown      generationStop = C.LLAMA_WRAPPER_STOP_UNKNOWN
+	generationStopEOG          generationStop = C.LLAMA_WRAPPER_STOP_EOG
+	generationStopWord         generationStop = C.LLAMA_WRAPPER_STOP_WORD
+	generationStopCallback     generationStop = C.LLAMA_WRAPPER_STOP_CALLBACK
+	generationStopLength       generationStop = C.LLAMA_WRAPPER_STOP_LENGTH
+	generationStopDecodeFailed generationStop = C.LLAMA_WRAPPER_STOP_DECODE_FAILED
+)
+
+// generationReport is what the loop says about a generation besides its
+// text: the tokens whose pieces make up the text, and why it stopped.
+type generationReport struct {
+	tokens int
+	stop   generationStop
+}
+
 // generateWithConfig is the internal generation implementation
 func (c *Context) generateWithConfig(prompt string, config generateConfig, callback func(string) bool) (string, error) {
+	return c.generate(prompt, config, callback, nil)
+}
+
+// generate runs the wrapper's generation loop on prompt. When report is not
+// nil the loop writes it, on failure too; when it is nil the loop is given no
+// output pointers, as before the report existed.
+func (c *Context) generate(prompt string, config generateConfig, callback func(string) bool, report *generationReport) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -664,8 +691,25 @@ func (c *Context) generateWithConfig(prompt string, config generateConfig, callb
 		debug:                       C.bool(config.debug),
 	}
 
+	// The loop writes the report through pointers held in a C struct, so they
+	// point at C memory rather than at Go variables.
+	var out *[2]C.int
+	if report != nil {
+		out = (*[2]C.int)(C.malloc(C.size_t(2 * C.sizeof_int)))
+		if out == nil {
+			return "", fmt.Errorf("generation failed: allocating the generation report")
+		}
+		defer C.free(unsafe.Pointer(out))
+		params.n_generated_out = &out[0]
+		params.stop_reason_out = &out[1]
+	}
+
 	// Call C generation function
 	cResult := C.llama_wrapper_generate(c.contextPtr, params)
+	if report != nil {
+		report.tokens = int(out[0])
+		report.stop = generationStop(out[1])
+	}
 	if cResult == nil {
 		return "", fmt.Errorf("generation failed: %s", C.GoString(C.llama_wrapper_last_error()))
 	}

@@ -293,7 +293,20 @@ static int findCommonPrefix(const std::vector<int>& a, const std::vector<int>& b
     return commonLen;
 }
 
+// Write the optional outputs of a generation. Every entry point reports UNKNOWN
+// with no tokens first and each loop overwrites that on its way out, so a call
+// that fails before its loop never leaves a caller reading the last call's.
+static void report_generation(const llama_wrapper_generate_params & params, int n_generated, llama_wrapper_stop_reason reason) {
+    if (params.n_generated_out) {
+        *params.n_generated_out = n_generated;
+    }
+    if (params.stop_reason_out) {
+        *params.stop_reason_out = static_cast<int>(reason);
+    }
+}
+
 char* llama_wrapper_generate_with_tokens(void* ctx, const int* tokens, int n_tokens, int prefix_len, llama_wrapper_generate_params params) {
+    report_generation(params, 0, LLAMA_WRAPPER_STOP_UNKNOWN);
     if (!ctx || !tokens) {
         g_last_error = "Context and tokens cannot be null";
         return nullptr;
@@ -468,9 +481,17 @@ char* llama_wrapper_generate_with_tokens(void* ctx, const int* tokens, int n_tok
         }
         // If n_tokens == 0, nothing to decode
 
-        // Generation loop - follows simple.cpp pattern
+        // Generation loop - follows simple.cpp pattern.
+        //
+        // n_generated counts the tokens whose pieces are in result, which is
+        // what a caller can hold against the text: the end-of-generation token
+        // and a token the callback refused are sampled and never appended. A
+        // loop that runs out of iterations stopped at the ceiling; every other
+        // exit names itself.
         std::string result;
         int n_decode = 0;
+        int n_generated = 0;
+        llama_wrapper_stop_reason stop_reason = LLAMA_WRAPPER_STOP_LENGTH;
 
         if (params.debug) {
             fprintf(stderr, "DEBUG: Starting generation loop, n_predict=%d, n_past=%d\n", n_predict, n_past);
@@ -494,6 +515,7 @@ char* llama_wrapper_generate_with_tokens(void* ctx, const int* tokens, int n_tok
                 if (params.debug) {
                     fprintf(stderr, "INFO: End of generation token encountered\n");
                 }
+                stop_reason = LLAMA_WRAPPER_STOP_EOG;
                 break;
             }
 
@@ -514,11 +536,13 @@ char* llama_wrapper_generate_with_tokens(void* ctx, const int* tokens, int n_tok
                     if (params.debug) {
                         fprintf(stderr, "INFO: Generation stopped by callback\n");
                     }
+                    stop_reason = LLAMA_WRAPPER_STOP_CALLBACK;
                     break;
                 }
             }
 
             result += token_str;
+            n_generated++;
 
             // Check stop words
             for (int j = 0; j < params.stop_words_count; j++) {
@@ -526,6 +550,7 @@ char* llama_wrapper_generate_with_tokens(void* ctx, const int* tokens, int n_tok
                     if (params.debug) {
                         fprintf(stderr, "INFO: Stop word found, ending generation\n");
                     }
+                    stop_reason = LLAMA_WRAPPER_STOP_WORD;
                     goto generation_done;
                 }
             }
@@ -553,11 +578,15 @@ char* llama_wrapper_generate_with_tokens(void* ctx, const int* tokens, int n_tok
                 fprintf(stderr, "DEBUG: Batch prepared, calling llama_decode\n");
             }
 
+            // A failed decode leaves no logits to sample the next token from.
+            // The token is already in result, so it is counted; the reason is
+            // what keeps the text from passing for an answer that finished.
             if (llama_decode(wrapper->ctx, gen_batch) != 0) {
                 if (params.debug) {
                     fprintf(stderr, "WARNING: decode failed, stopping generation\n");
                 }
                 llama_batch_free(gen_batch);
+                stop_reason = LLAMA_WRAPPER_STOP_DECODE_FAILED;
                 break;
             }
 
@@ -575,6 +604,7 @@ char* llama_wrapper_generate_with_tokens(void* ctx, const int* tokens, int n_tok
 
 generation_done:
         common_sampler_free(sampler);
+        report_generation(params, n_generated, stop_reason);
 
         // Return allocated string (caller must free)
         char* c_result = (char*)malloc(result.length() + 1);
@@ -594,6 +624,7 @@ generation_done:
 
 // Simple wrapper that tokenises the prompt and handles prefix caching automatically
 char* llama_wrapper_generate(void* ctx, llama_wrapper_generate_params params) {
+    report_generation(params, 0, LLAMA_WRAPPER_STOP_UNKNOWN);
     if (!ctx) {
         g_last_error = "Context cannot be null";
         return nullptr;
@@ -639,6 +670,7 @@ char* llama_wrapper_generate(void* ctx, llama_wrapper_generate_params params) {
 }
 
 char* llama_wrapper_generate_draft_with_tokens(void* ctx_target, void* ctx_draft, const int* tokens, int n_tokens, int target_prefix_len, int draft_prefix_len, llama_wrapper_generate_params params) {
+    report_generation(params, 0, LLAMA_WRAPPER_STOP_UNKNOWN);
     if (!ctx_target || !ctx_draft || !tokens) {
         g_last_error = "Target, draft contexts and tokens cannot be null";
         return nullptr;
@@ -856,6 +888,14 @@ char* llama_wrapper_generate_draft_with_tokens(void* ctx_target, void* ctx_draft
         common_speculative_begin(spec, seq_id, prompt_tgt);
         llama_tokens draft;
 
+        // n_generated is exact, as in the plain loop. The reason is exact for
+        // EOG, a stop word, the callback and a failed decode. Leaving the while
+        // is not the token ceiling -- it compares the text's length in bytes
+        // against n_predict -- and an empty verification is none of the
+        // others, so both stay UNKNOWN rather than being named.
+        int n_generated = 0;
+        llama_wrapper_stop_reason stop_reason = LLAMA_WRAPPER_STOP_UNKNOWN;
+
         // Generation loop
         while (result.length() < (size_t)n_predict) {
             // Generate draft tokens (b9670 stateful API: set per-seq draft params,
@@ -890,6 +930,7 @@ char* llama_wrapper_generate_draft_with_tokens(void* ctx_target, void* ctx_draft
                 if (params.debug) {
                     fprintf(stderr, "WARNING: target decode failed, stopping\n");
                 }
+                stop_reason = LLAMA_WRAPPER_STOP_DECODE_FAILED;
                 break;
             }
 
@@ -898,6 +939,7 @@ char* llama_wrapper_generate_draft_with_tokens(void* ctx_target, void* ctx_draft
                 if (params.debug) {
                     fprintf(stderr, "WARNING: draft decode failed, stopping\n");
                 }
+                stop_reason = LLAMA_WRAPPER_STOP_DECODE_FAILED;
                 break;
             }
 
@@ -928,6 +970,7 @@ char* llama_wrapper_generate_draft_with_tokens(void* ctx_target, void* ctx_draft
                 // Check for EOS
                 if (llama_vocab_is_eog(llama_model_get_vocab(wrapper_tgt->model), id)) {
                     early_termination = true;
+                    stop_reason = LLAMA_WRAPPER_STOP_EOG;
                     break;
                 }
 
@@ -937,6 +980,7 @@ char* llama_wrapper_generate_draft_with_tokens(void* ctx_target, void* ctx_draft
                 if (params.callback_handle != 0) {
                     if (!goTokenCallback(params.callback_handle, token_str.c_str())) {
                         early_termination = true;
+                        stop_reason = LLAMA_WRAPPER_STOP_CALLBACK;
                         break;
                     }
                 }
@@ -944,11 +988,13 @@ char* llama_wrapper_generate_draft_with_tokens(void* ctx_target, void* ctx_draft
                 result += token_str;
                 prompt_tgt.push_back(id);
                 tokens_processed++;
+                n_generated++;
 
                 // Check stop words
                 for (int j = 0; j < params.stop_words_count; j++) {
                     if (result.find(params.stop_words[j]) != std::string::npos) {
                         early_termination = true;
+                        stop_reason = LLAMA_WRAPPER_STOP_WORD;
                         goto early_exit;
                     }
                 }
@@ -988,6 +1034,7 @@ early_exit:
         llama_batch_free(batch_tgt);
         common_sampler_free(sampler);
         common_speculative_free(spec);
+        report_generation(params, n_generated, stop_reason);
 
         // Return allocated string
         char* c_result = (char*)malloc(result.length() + 1);
@@ -1007,6 +1054,7 @@ early_exit:
 
 // Simple wrapper that tokenises the prompt and handles prefix caching automatically for both models
 char* llama_wrapper_generate_draft(void* ctx_target, void* ctx_draft, llama_wrapper_generate_params params) {
+    report_generation(params, 0, LLAMA_WRAPPER_STOP_UNKNOWN);
     if (!ctx_target || !ctx_draft) {
         g_last_error = "Target and draft contexts cannot be null";
         return nullptr;
