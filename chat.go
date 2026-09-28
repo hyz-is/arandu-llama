@@ -350,6 +350,9 @@ func chatGenerateOptions(opts ChatOptions) []GenerateOption {
 	if opts.TopK != nil {
 		genOpts = append(genOpts, WithTopK(*opts.TopK))
 	}
+	if opts.MinP != nil {
+		genOpts = append(genOpts, WithMinP(*opts.MinP))
+	}
 	if opts.Seed != nil {
 		genOpts = append(genOpts, WithSeed(*opts.Seed))
 	}
