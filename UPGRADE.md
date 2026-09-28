@@ -9,6 +9,14 @@ counts produced through `FormatChatPrompt` must be regenerated after upgrading,
 and should record `ChatTemplateEngine` beside the template digest. Pass
 `EnableThinking` explicitly when the thinking default matters.
 
+Callers that scored `ChatResponse.Content` from a reasoning model with a
+`ReasoningFormat` other than none were scoring the model's reasoning, because
+the parse had no parser and returned everything as content. Read recorded
+outputs again with `ParseChatOutput`. `Chat` can now fail where it used to
+return text: a parse failure, a decode failure or a cancelled context is an
+error. Check `FinishReason` before treating `Content` as an answer; with
+`FinishReasonLength` it may be empty. `ReasoningFormatNone` is unchanged.
+
 Model identities now belong to private installation configuration. Construct
 `NewMXCatalog` from typed `MXModelIdentity` entries and pass the selected identity
 in `MXConfig.Model`. Repository, revision, manifest, quantisation and shard

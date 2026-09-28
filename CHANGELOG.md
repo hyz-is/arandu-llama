@@ -23,11 +23,20 @@ a release is corrected by another release and never by moving a tag.
   `DeriveInitialReference` derives the initial adapter reference for a declared
   coverage. A nil coverage keeps `q_proj` and `v_proj` of the full-attention
   layers with every earlier digest unchanged.
+- `ParseChatOutput` reads a recorded chat output back into `Content` and
+  `ReasoningContent` without a model, the way `Chat` does. `ChatResponse` gains
+  `Output`, `FinishReason` (`FinishReasonStop`, `FinishReasonLength`) and
+  `GeneratedTokens`, counted in the generation loop. `ChatOptions` gains `MinP`.
 
 ### Fixed
 
 - Each training backward runs on one OS thread, so a local SFT step on the CPU
   repeats bit for bit.
+- With a `ReasoningFormat` other than none, `Chat` and `ChatStream` parse the
+  output with the parser llama.cpp builds for the template, and with its
+  generation prompt. gpt-oss's analysis channel, Qwen3.8's thinking block and
+  Gemma 4's thought channel now land in `ReasoningContent` instead of
+  `Content`.
 
 ### Changed
 
@@ -36,6 +45,11 @@ a release is corrected by another release and never by moving a tag.
   gone and nothing falls back to it: a template that does not render is an
   error. `EnableThinking` and `ChatTemplateKwargs` now reach the template, and
   thinking follows the llama-server default when unset.
+- `Chat` returns an error where it used to return text: when the output does
+  not parse under a `ReasoningFormat` other than none, when `llama_decode`
+  fails mid-generation, and `ctx.Err()` when the context is cancelled. It no
+  longer returns the raw output as `Content` after a failed parse. A
+  `ReasoningFormat` outside the four constants is an error.
 
 - Training uses architecture and role contracts, with installation-owned model
   identities and recipes supplied explicitly. Existing calculations and artifact
