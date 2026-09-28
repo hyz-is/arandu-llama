@@ -16,8 +16,23 @@ func runCurriculum(ctx context.Context, loaded *decoder.LoadedTextModel, data, p
 }
 
 func runCurriculumWithHooks(ctx context.Context, loaded *decoder.LoadedTextModel, data, previous, output string, maxTokens, maxSteps int, c Config, hooks *stepHooks, device torch.Device) error {
+	return runCurriculumWithSignals(ctx, loaded, data, previous, output, maxTokens, maxSteps, c, hooks, device, nil)
+}
+
+// runCurriculumWithSignals runs the admitted steps. signals are the recipe's
+// distillation caches when the caller already read them, and are read here
+// otherwise; a recipe without distillation has none.
+func runCurriculumWithSignals(ctx context.Context, loaded *decoder.LoadedTextModel, data, previous, output string, maxTokens, maxSteps int, c Config, hooks *stepHooks, device torch.Device, signals *distillationSignals) error {
 	rows, prior, next, err := curriculumPosition(data, previous, c)
 	if err != nil {
+		return err
+	}
+	if signals == nil {
+		if signals, err = loadDistillation(ctx, c, rows); err != nil {
+			return err
+		}
+	}
+	if err := distillationStudent(loaded.Model, c.Recipe.Distillation); err != nil {
 		return err
 	}
 	completed := 0
@@ -29,6 +44,12 @@ func runCurriculumWithHooks(ctx context.Context, loaded *decoder.LoadedTextModel
 			break
 		}
 		row, err := selectedID(data, rows[i].ID)
+		if err != nil {
+			return err
+		}
+		// A row the caches do not match is refused before its intent exists,
+		// so the refusal leaves no uncertain attempt behind.
+		teachers, err := signals.teachersFor(i, row)
 		if err != nil {
 			return err
 		}
@@ -51,7 +72,7 @@ func runCurriculumWithHooks(ctx context.Context, loaded *decoder.LoadedTextModel
 		if hooks != nil {
 			storage = hooks.storage
 		}
-		stepErr := resumeNextWithStorage(ctx, loaded, row, previous, target, c.Recipe, storage)
+		stepErr := resumeNextWithStorage(ctx, loaded, row, previous, target, c.Recipe, storage, teachers)
 		for layer := range loaded.Model.Layers {
 			if loaded.Model.Layers[layer].Weights.Full != nil {
 				loaded.Model.Layers[layer].Cosine, loaded.Model.Layers[layer].Sine = nil, nil

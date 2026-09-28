@@ -1,5 +1,6 @@
-// Package local executes bounded causal SFT updates with caller-owned recipes.
-// It does not claim multi-teacher fusion or scientific qualification.
+// Package local executes bounded causal SFT updates with caller-owned recipes,
+// optionally distilling teacher-forced logits over the student's vocabulary.
+// It does not claim constrained fusion or scientific qualification.
 package local
 
 import (
@@ -20,6 +21,9 @@ var ErrUnavailable = errors.New("local training: LibTorch backend unavailable")
 
 // Recipe supplies every scientific identity, numerical setting and memory bound.
 // The only supported method here is causal-sft-v1; fusion has a separate pipeline.
+// Distillation, when declared, blends teacher-forced top-k distributions into
+// every step's target under the same AdamW and checkpoints. An absent block is
+// not encoded, so a recipe without one keeps its digest and its SFT step.
 type Recipe struct {
 	Method             string
 	BaseRevision       string
@@ -34,6 +38,7 @@ type Recipe struct {
 	Optimizer          optim.AdamWConfig
 	LossScale          float64
 	MaxCheckpointBytes int64
+	Distillation       *Distillation `json:",omitempty"`
 }
 
 // Config fixes paths, work bounds and an explicit immutable recipe.
@@ -49,6 +54,10 @@ type Config struct {
 	// It is a field rather than an empty path because an empty path has always
 	// been refused here, and a missing path must not quietly become a new run.
 	FreshStart bool
+	// CacheDir holds every teacher cache a distillation recipe names, each as
+	// <sha256>.json, the name fusioncache.DirectorySink stores it under. It is
+	// required with a distillation recipe and refused without one.
+	CacheDir string
 }
 
 // Progress identifies the latest complete checkpoint of this delivery.
@@ -86,6 +95,11 @@ func (c Config) validate() error {
 	if err := c.Recipe.validate(); err != nil {
 		return err
 	}
+	// Caches are read only for a recipe that names them; a directory beside a
+	// recipe without distillation is a configuration mistake, not a default.
+	if c.Recipe.Distillation != nil && (!filepath.IsAbs(c.CacheDir) || filepath.Clean(c.CacheDir) != c.CacheDir) || c.Recipe.Distillation == nil && c.CacheDir != "" {
+		return errors.Join(ErrDistillation, errors.New("a distillation recipe names its cache directory; no other recipe does"))
+	}
 	for step, hash := range c.AdmittedCheckpoints {
 		if step == 0 || !validHash(hash) {
 			return errors.New("local training: historical checkpoint identity invalid")
@@ -111,6 +125,11 @@ func (r Recipe) validate() error {
 	// the q/v coverage every earlier recipe trained.
 	if err := r.Assembly.AdapterCoverage.Validate(); err != nil {
 		return errors.Join(errRecipe, err)
+	}
+	if r.Distillation != nil {
+		if err := r.Distillation.validate(r.BaseRevision); err != nil {
+			return err
+		}
 	}
 	return optim.ValidateAdamWConfig(r.Optimizer)
 }

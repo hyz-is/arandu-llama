@@ -79,6 +79,8 @@ func (p StageProtocol) Digest() (string, error) {
 
 // StageConfig installs the concrete local MPS continuation backend. Only source
 // directories are supplied; outputs always belong to StageContext.ArtifactDirectory.
+// CacheDirectory holds every teacher cache a distillation protocol names, each
+// as <sha256>.json; it is required with distillation and refused without it.
 type StageConfig struct {
 	Recipe           pipeline.Recipe
 	Placement        pipeline.Placement
@@ -88,9 +90,13 @@ type StageConfig struct {
 	ModelDirectory   string
 	DataDirectory    string
 	InitialDirectory string
+	CacheDirectory   string
 }
 
-// Stage implements causal SFT continuation, never fusion or quantized recovery.
+// Stage implements causal SFT continuation, with teacher-forced logit
+// distillation when the protocol's recipe declares it, never constrained
+// fusion or quantized recovery. Declared caches are imported beside the data
+// before any calculation and are named in every result as seed artifacts.
 // DurableRuntime must own the capacity/process lock; direct users must provide
 // the same exclusive ownership and protect source/output files from mutation.
 type Stage struct {
@@ -132,6 +138,11 @@ func newStage(c StageConfig, execute stageDelivery) (*Stage, error) {
 		}
 	} else {
 		sources = append(sources, c.InitialDirectory)
+	}
+	if c.Protocol.Local.Distillation != nil {
+		sources = append(sources, c.CacheDirectory)
+	} else if c.CacheDirectory != "" {
+		return nil, ErrStage
 	}
 	for _, p := range sources {
 		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
@@ -185,12 +196,36 @@ func (p StageProtocol) validate() error {
 		!stageArtifact(p.Initial.Manifest, l.MaxManifestBytes) || !stageArtifact(p.Initial.Adapter, l.MaxTensorFileBytes) || !stageArtifact(p.Initial.Optimizer, l.MaxTensorFileBytes) {
 		return ErrStage
 	}
+	// Distillation caches are this stage's student's, taken over this stage's
+	// training input; their bytes are reserved on disk and, four times over
+	// while one is decoded and kept, in working memory. That reservation is
+	// not a measured peak.
+	caches := p.cacheArtifacts()
+	var cacheBytes int64
+	if d := p.Local.Distillation; d != nil {
+		if d.Student != p.Student || d.DatasetSHA256 != p.Data.Input.SHA256 {
+			return ErrStage
+		}
+		for _, a := range caches {
+			if !stageArtifact(a, d.CacheLimits.MaxBytes) || a.Bytes > l.MaxTotalBytes-cacheBytes {
+				return ErrStage
+			}
+			cacheBytes += a.Bytes
+		}
+	}
 	ck := l.Checkpoint
 	if ck.MaxHeaderBytes < 1 || ck.MaxHeaderBytes > l.MaxTensorFileBytes || ck.MaxTensors < 1 || ck.MaxTensors > 65536 || ck.MaxDimensions < 2 || ck.MaxDimensions > 32 || ck.MaxMetadataEntries < 1 || ck.MaxChunkBytes < 4 || ck.MaxChunkBytes > 4<<20 {
 		return ErrStage
 	}
 	remaining := l.WorkingBytes
-	for _, n := range []int64{4 * l.MaxDataBytes, 16 * l.MaxMetadataBytes, 16 * l.MaxDataTokens, 64 * l.MaxParameters, int64(ck.MaxChunkBytes), ck.MaxHeaderBytes} {
+	working := []int64{4 * l.MaxDataBytes, 16 * l.MaxMetadataBytes, 16 * l.MaxDataTokens, 64 * l.MaxParameters, int64(ck.MaxChunkBytes), ck.MaxHeaderBytes}
+	if cacheBytes > 0 {
+		if cacheBytes > math.MaxInt64/4 {
+			return ErrStage
+		}
+		working = append(working, 4*cacheBytes)
+	}
+	for _, n := range working {
 		if n < 1 || n > remaining {
 			return ErrStage
 		}
@@ -198,7 +233,7 @@ func (p StageProtocol) validate() error {
 	}
 	// Reserve every source plus all declared durable step files, including intent.
 	remaining = l.MaxTotalBytes
-	for _, a := range []pipeline.StageArtifact{p.Data.Artifact, p.Initial.Manifest, p.Initial.Adapter, p.Initial.Optimizer} {
+	for _, a := range append([]pipeline.StageArtifact{p.Data.Artifact, p.Initial.Manifest, p.Initial.Adapter, p.Initial.Optimizer}, caches...) {
 		if a.Bytes > remaining {
 			return ErrStage
 		}
@@ -264,13 +299,30 @@ func (h *Stage) localConfig(root string, step uint64) Config {
 	if p.Initial.AllowHistorical {
 		c.AdmittedCheckpoints = map[uint64]string{p.Initial.Step: p.Initial.Manifest.SHA256}
 	}
+	if p.Local.Distillation != nil {
+		c.CacheDir = filepath.Join(root, h.cacheName())
+	}
 	return c
 }
 
 // fresh reports a start at the recipe's initializer, before any checkpoint.
 func (p StageProtocol) fresh() bool { return p.Initial.Step == 0 }
 
+// cacheArtifacts are the distillation caches the recipe declares, by the name
+// each has in the cache directory: its SHA-256, as fusioncache stores it.
+func (p StageProtocol) cacheArtifacts() []pipeline.StageArtifact {
+	if p.Local.Distillation == nil {
+		return nil
+	}
+	caches := make([]pipeline.StageArtifact, 0, len(p.Local.Distillation.Teachers))
+	for _, t := range p.Local.Distillation.Teachers {
+		caches = append(caches, pipeline.StageArtifact{Path: t.CacheSHA256 + ".json", SHA256: t.CacheSHA256, Bytes: t.CacheBytes})
+	}
+	return caches
+}
+
 func (h *Stage) seedName() string   { return "sft-" + h.stage.ID + "-initial" }
+func (h *Stage) cacheName() string  { return filepath.Join(h.seedName(), "caches") }
 func (h *Stage) outputName() string { return "sft-" + h.stage.ID }
 func (h *Stage) stepName(n uint64) string {
 	return filepath.Join(h.outputName(), fmt.Sprintf("step-%03d", n))

@@ -132,6 +132,21 @@ func run(ctx context.Context, bundle, modelDir, data, output, reload, nextID str
 	if curriculumMax > 0 {
 		tokens = int64(curriculumMax)
 	}
+	// Distillation runs only through the curriculum, and its caches are read
+	// and validated here, before a plan is built or a weight is loaded.
+	var signals *distillationSignals
+	if c.Recipe.Distillation != nil {
+		if curriculumMax == 0 || nextID != "" {
+			return errors.Join(ErrDistillation, errors.New("distillation runs only through the admitted curriculum"))
+		}
+		rows, _, _, err := curriculumPosition(data, reload, c)
+		if err != nil {
+			return err
+		}
+		if signals, err = loadDistillation(ctx, c, rows); err != nil {
+			return err
+		}
+	}
 	plan, err := decoder.PlanLocalMPSAssembly(index, config, reference, c.Recipe.Identity, c.Recipe.Assembly, c.Recipe.MaxMPSBytes)
 	if err != nil {
 		return err
@@ -160,7 +175,7 @@ func run(ctx context.Context, bundle, modelDir, data, output, reload, nextID str
 	defer func() { err = errors.Join(err, loaded.Close()) }()
 	fmt.Printf("phase=loaded elapsed=%s receipts=%d\n", time.Since(start), len(loaded.Receipts))
 	if curriculumMax > 0 {
-		return runCurriculumWithHooks(ctx, loaded, data, reload, output, curriculumMax, curriculumSteps, c, hooks, torch.MPSDevice())
+		return runCurriculumWithSignals(ctx, loaded, data, reload, output, curriculumMax, curriculumSteps, c, hooks, torch.MPSDevice(), signals)
 	}
 	tables, err := decoder.TextRotary(ctx, len(row.InputIDs), torch.MPSDevice(), c.Recipe.Rotary)
 	if err != nil {

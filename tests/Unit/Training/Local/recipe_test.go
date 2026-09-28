@@ -3,6 +3,7 @@ package local_test
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/tayi-ai/arandu-llama/training/local"
@@ -28,5 +29,43 @@ func TestRecipeWithoutCoverageKeepsItsCheckpointDigest(t *testing.T) {
 	}
 	if bytes.Contains(encoded, []byte("Coverage")) {
 		t.Fatal("an undeclared coverage entered the recipe encoding")
+	}
+}
+
+func TestARecipeWithoutDistillationEncodesAsBefore(t *testing.T) {
+	var recipe local.Recipe
+	if err := json.Unmarshal([]byte(historicalRecipe), &recipe); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(recipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recipe.Digest() != historicalRecipeSHA256 || bytes.Contains(encoded, []byte("Distillation")) {
+		t.Fatalf("a recipe without distillation encodes differently:\n%s", encoded)
+	}
+}
+
+// distilledRecipe is historicalRecipe with a distillation block. A reader that
+// drops the block would train that recipe as plain SFT under the SFT digest.
+func distilledRecipe() string {
+	block := `,"Distillation":{"Method":"logit-kd-v1","DatasetID":"training","DatasetSHA256":"` + strings.Repeat("d", 64) + `","Student":{"name":"student","revision":"489cb97981b8654bcfcf30ce1f94ed1b62e07b53","weights_sha256":"` + strings.Repeat("1", 64) + `","tokenizer_sha256":"` + strings.Repeat("2", 64) + `","template_sha256":"` + strings.Repeat("3", 64) + `","runtime_sha256":"` + strings.Repeat("4", 64) + `","vocabulary":248320},"Teachers":[],"CacheLimits":{"MaxBytes":1,"MaxExamples":1,"MaxTokens":2,"MaxPositions":1,"MaxTopK":1,"MaxFeatureValues":0,"MaxMappingPairs":0}}}`
+	return strings.TrimSuffix(historicalRecipe, "}") + block
+}
+
+func TestADeclaredDistillationEntersTheRecipeIdentity(t *testing.T) {
+	var recipe local.Recipe
+	if err := json.Unmarshal([]byte(distilledRecipe()), &recipe); err != nil {
+		t.Fatal(err)
+	}
+	if recipe.Digest() == historicalRecipeSHA256 {
+		t.Fatal("a declared distillation was dropped from the recipe identity")
+	}
+	encoded, err := json.Marshal(recipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"Distillation":{"Method":"logit-kd-v1"`)) {
+		t.Fatalf("the distillation block did not survive the recipe encoding:\n%s", encoded)
 	}
 }

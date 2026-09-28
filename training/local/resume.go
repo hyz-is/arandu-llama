@@ -112,10 +112,12 @@ func freshAdapter(ctx context.Context, recipe Recipe, names []string, shapes [][
 }
 
 func resumeNext(ctx context.Context, loaded *decoder.LoadedTextModel, row example, previous, output string, recipe Recipe) error {
-	return resumeNextWithStorage(ctx, loaded, row, previous, output, recipe, nil)
+	return resumeNextWithStorage(ctx, loaded, row, previous, output, recipe, nil, nil)
 }
 
-func resumeNextWithStorage(ctx context.Context, loaded *decoder.LoadedTextModel, row example, previous, output string, recipe Recipe, storage *stepStorage) error {
+// resumeNextWithStorage takes teachers, the row's distillation signals, which
+// a recipe with distillation requires and any other recipe refuses.
+func resumeNextWithStorage(ctx context.Context, loaded *decoder.LoadedTextModel, row example, previous, output string, recipe Recipe, storage *stepStorage, teachers []decoder.FusionTeacher) error {
 	started := time.Now()
 	memory := func(phase string) {
 		stats, err := torch.ReadMPSMemory()
@@ -205,9 +207,7 @@ func resumeNextWithStorage(ctx context.Context, loaded *decoder.LoadedTextModel,
 		fmt.Printf("phase=checkpoint_reload_verified step=%d logits_sha256=%s elapsed=%s\n", prior.Step, observed, time.Since(started))
 		return nil
 	}
-	tokens := int64(len(row.InputIDs))
-	gradient, err := decoder.CompletionGradient(ctx, loaded.Model, row.InputIDs, row.PromptTokens,
-		decoder.Limits{MaxTokens: tokens, LogitRows: tokens - int64(row.PromptTokens) + 1, MaxCheckpointBytes: recipe.MaxCheckpointBytes}, recipe.LossScale)
+	gradient, distilled, err := completionStep(ctx, loaded.Model, row, recipe, teachers)
 	if err != nil || gradient.Tokens != len(row.InputIDs)-row.PromptTokens || len(gradient.Gradients) != len(names) {
 		return errors.Join(errors.New("resumed completion gradient incomplete"), err)
 	}
@@ -268,6 +268,9 @@ func resumeNextWithStorage(ctx context.Context, loaded *decoder.LoadedTextModel,
 	manifest := stepManifest{RecipeSHA256: recipe.Digest(), Step: next.Step, ExampleID: row.ID, SupervisedTokens: gradient.Tokens, LossBefore: gradient.Loss,
 		UpdatedAdapterSHA: nextDigest, AdapterFileSHA: adapterReceipt.SHA256, OptimizerFileSHA: momentsReceipt.SHA256,
 		LogitsAfterSHA: after, BaseRevision: prior.BaseRevision}
+	if distilled != nil {
+		manifest.DistillationLossBefore, manifest.TeacherMass, manifest.TeacherLosses = &distilled.loss, distilled.teacherMass, distilled.teacherLosses
+	}
 	body, err = json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
@@ -298,6 +301,9 @@ func resumeNextWithStorage(ctx context.Context, loaded *decoder.LoadedTextModel,
 	}
 	if err != nil {
 		return err
+	}
+	if distilled != nil {
+		fmt.Printf("phase=distillation step=%d hard_loss=%g distillation_loss=%g\n", receipt.Step, gradient.Loss, distilled.loss)
 	}
 	fmt.Printf("phase=step_verified step=%d loss=%g tokens=%d changed=%d elapsed=%s checkpoint=%s\n", receipt.Step, gradient.Loss, gradient.Tokens, receipt.ChangedParameter, time.Since(started), output)
 	return nil

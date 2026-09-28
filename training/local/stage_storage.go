@@ -185,6 +185,26 @@ func (h *Stage) prepare(ctx context.Context, c pipeline.StageContext) ([]example
 				}
 			}
 		}
+		// Distillation caches are pinned beside the data by their digests, so
+		// a source changed after admission cannot reach a step.
+		if caches := h.config.Protocol.cacheArtifacts(); len(caches) > 0 {
+			cacheRoot, err := stageRoot(h.config.CacheDirectory)
+			if err != nil {
+				return nil, err
+			}
+			defer cacheRoot.Close()
+			if err := os.Mkdir(filepath.Join(temp, "caches"), 0700); err != nil {
+				return nil, err
+			}
+			for _, a := range caches {
+				if err := stageCopy(ctx, cacheRoot, a, filepath.Join(temp, "caches", a.Path)); err != nil {
+					return nil, fmt.Errorf("local SFT: distillation cache: %w", err)
+				}
+			}
+			if err := syncLocalDirectory(filepath.Join(temp, "caches")); err != nil {
+				return nil, err
+			}
+		}
 		if err := syncLocalDirectory(temp); err != nil {
 			return nil, err
 		}
@@ -482,12 +502,18 @@ func (h *Stage) seedArtifacts() []pipeline.StageArtifact {
 	}
 	a := p.Data.Artifact
 	a.Path = filepath.Join(h.seedName(), "data.jsonl")
-	return append(out, a)
+	out = append(out, a)
+	for _, c := range p.cacheArtifacts() {
+		c.Path = filepath.Join(h.cacheName(), c.Path)
+		out = append(out, c)
+	}
+	return out
 }
 
 // stepManifest returns a result's own manifest, which follows the seed
-// artifacts. Its position depends on whether the stage started fresh, so it is
-// computed rather than written as a constant index.
+// artifacts. Its position depends on whether the stage started fresh and on
+// the caches it declares, so it is computed rather than written as a constant
+// index.
 func (h *Stage) stepManifestArtifact(r pipeline.StageResult) pipeline.StageArtifact {
 	return r.Artifacts[len(h.seedArtifacts())]
 }
