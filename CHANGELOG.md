@@ -68,6 +68,20 @@ a release is corrected by another release and never by moving a tag.
   and `in_proj_a`, and the columns of `out_proj`. Unknown modules, the MTP
   block, a rank other than the recipe's and non-finite factors are refused.
   `WriteInitialLoRA` is unchanged, byte for byte.
+- `decoder.OnPolicyCompletionGradient` distils on a completion the student
+  sampled, with three objectives over the teacher's top-k and one complement
+  cell:
+  - `fkl-complement` puts no mass on the realized token. It equals
+    `FusionCompletionGradient` with one teacher of weight one when every
+    retained mass is exactly one.
+  - `jsd-complement` is the generalized JSD, with beta in (0, 1).
+  - `rkl-sampled` is the reverse KL at the realized token, with a truncated
+    per-token importance weight. It requires the teacher's and the sampler's
+    log probability of every token.
+
+  The loss is the mean per completion token; `lossScale` scales only the
+  cotangent. `decoder.CompletionTokenLogProbabilities` reads the student's
+  log-softmax at every completion token.
 
 ### Fixed
 
