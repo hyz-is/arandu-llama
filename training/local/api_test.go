@@ -130,3 +130,29 @@ func TestPublicConfigSnapshotAppliesExecutionValidation(t *testing.T) {
 		})
 	}
 }
+
+// A declared coverage is validated and bound into the recipe digest, so a
+// checkpoint written under one coverage is refused under another; an absent
+// declaration keeps the q/v digest.
+func TestRecipeCoverageIsValidatedAndBound(t *testing.T) {
+	c := checkpointFixture(t)
+	legacy := c.Recipe.Digest()
+	c.Recipe.Assembly.AdapterCoverage = decoder.FullAdapterCoverage()
+	if _, err := c.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Recipe.Digest() == legacy {
+		t.Fatal("the declared coverage left the recipe digest unchanged")
+	}
+	if _, err := LatestCheckpoint(c); err == nil {
+		t.Fatal("a q/v checkpoint was admitted under the full declaration")
+	}
+	c.Recipe.Assembly.AdapterCoverage = &decoder.AdapterCoverage{Version: 1, MLP: []string{"down_proj", "gate_proj"}}
+	if _, err := c.Snapshot(); err == nil {
+		t.Fatal("an out-of-order declaration was admitted")
+	}
+	c.Recipe.Assembly.AdapterCoverage = nil
+	if c.Recipe.Digest() != legacy {
+		t.Fatal("removing the declaration did not restore the q/v digest")
+	}
+}

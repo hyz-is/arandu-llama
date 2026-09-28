@@ -222,10 +222,17 @@ func sftFixture(t *testing.T) (StageConfig, pipeline.StageContext, []example) {
 	ctx := pipeline.StageContext{Execution: pipeline.Execution{RunID: "run", TenantID: "tenant", Generation: 1, Recipe: r, TargetSHA256: ref("execution-target").SHA256, Placement: placement}, Stage: r.Stages[0], ArtifactDirectory: artifacts}
 	return c, ctx, rows
 }
+
+// cpuModel builds a fresh CPU model owner and its release, one per delivery.
+type cpuModel func(*testing.T) (*decoder.LoadedTextModel, func() error)
+
 func sftExecutor(t *testing.T, calls *int, closed *int) stageDelivery {
+	return sftExecutorWith(t, sftCPUModel, calls, closed)
+}
+func sftExecutorWith(t *testing.T, model cpuModel, calls *int, closed *int) stageDelivery {
 	return func(ctx context.Context, c Config, hooks *stepHooks) (err error) {
 		*calls++
-		m, close := sftCPUModel(t)
+		m, close := model(t)
 		defer func() { err = errors.Join(err, close()); *closed++ }()
 		return runCurriculumWithHooks(ctx, m, c.DataPath, c.InitialCheckpoint, c.CheckpointRoot, c.MaxTokens, c.MaxSteps, c, hooks, torch.CPUDevice())
 	}

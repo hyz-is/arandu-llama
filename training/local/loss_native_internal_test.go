@@ -20,8 +20,12 @@ import (
 func lossTrajectory(t *testing.T) (LossConfig, []string, []example, decoder.InitialAdapterSpec, StageConfig) {
 	t.Helper()
 	c, stage, rows, spec := sftFreshFixture(t)
+	return lossTrajectoryWith(t, sftCPUModel, c, stage, rows, spec)
+}
+func lossTrajectoryWith(t *testing.T, cpu cpuModel, c StageConfig, stage pipeline.StageContext, rows []example, spec decoder.InitialAdapterSpec) (LossConfig, []string, []example, decoder.InitialAdapterSpec, StageConfig) {
+	t.Helper()
 	calls, closed := 0, 0
-	h, e := newStage(c, sftExecutor(t, &calls, &closed))
+	h, e := newStage(c, sftExecutorWith(t, cpu, &calls, &closed))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -44,6 +48,9 @@ func lossTrajectory(t *testing.T) (LossConfig, []string, []example, decoder.Init
 }
 
 func readLosses(t *testing.T, c LossConfig, requests []LossRequest) ([]LossResult, error) {
+	return readLossesWith(t, sftCPUModel, c, requests)
+}
+func readLossesWith(t *testing.T, cpu cpuModel, c LossConfig, requests []LossRequest) ([]LossResult, error) {
 	t.Helper()
 	ctx := context.Background()
 	rows, e := lossRows(ctx, c, requests)
@@ -54,7 +61,7 @@ func readLosses(t *testing.T, c LossConfig, requests []LossRequest) ([]LossResul
 	if e != nil {
 		t.Fatal(e)
 	}
-	model, close := sftCPUModel(t)
+	model, close := cpu(t)
 	defer close()
 	return measureLosses(ctx, model, c, rows, manifests, requests, torch.CPUDevice())
 }

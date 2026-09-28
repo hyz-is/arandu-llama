@@ -43,9 +43,12 @@ func sftFreshFixture(t *testing.T) (StageConfig, pipeline.StageContext, []exampl
 // and update per example. Nothing here is shared with the stage beyond the
 // primitives both must use.
 func freshTrajectory(t *testing.T, c StageConfig, rows []example, spec decoder.InitialAdapterSpec, steps int) ([]float64, []checkpoint.Float32Tensor, []checkpoint.Float32Tensor) {
+	return freshTrajectoryWith(t, sftCPUModel, c, rows, spec, steps)
+}
+func freshTrajectoryWith(t *testing.T, cpu cpuModel, c StageConfig, rows []example, spec decoder.InitialAdapterSpec, steps int) ([]float64, []checkpoint.Float32Tensor, []checkpoint.Float32Tensor) {
 	t.Helper()
 	ctx := context.Background()
-	model, close := sftCPUModel(t)
+	model, close := cpu(t)
 	defer close()
 	initial, e := decoder.InitializeAdapter(ctx, spec)
 	if e != nil {
@@ -77,10 +80,10 @@ func freshTrajectory(t *testing.T, c StageConfig, rows []example, spec decoder.I
 		if e != nil {
 			t.Fatal(e)
 		}
-		model.Model.Layers[0].Cosine, model.Model.Layers[0].Sine = tables.Cosine, tables.Sine
+		rotary(model, tables.Cosine, tables.Sine)
 		g, e := decoder.CompletionGradient(ctx, model.Model, row.InputIDs, row.PromptTokens, decoder.Limits{MaxTokens: int64(len(row.InputIDs)), LogitRows: int64(len(row.InputIDs) - row.PromptTokens + 1), MaxCheckpointBytes: c.Protocol.Local.MaxCheckpointBytes}, c.Protocol.Local.LossScale)
 		tables.Close()
-		model.Model.Layers[0].Cosine, model.Model.Layers[0].Sine = nil, nil
+		rotary(model, nil, nil)
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -104,10 +107,13 @@ func freshTrajectory(t *testing.T, c StageConfig, rows []example, spec decoder.I
 // the loss before every step, the absolute cursor, the final adapter and the
 // final moments bit for bit.
 func sameAsTrajectory(t *testing.T, h *Stage, c StageConfig, stage pipeline.StageContext, rows []example, results []pipeline.StageResult, spec decoder.InitialAdapterSpec) {
+	sameAsTrajectoryWith(t, sftCPUModel, h, c, stage, rows, results, spec)
+}
+func sameAsTrajectoryWith(t *testing.T, cpu cpuModel, h *Stage, c StageConfig, stage pipeline.StageContext, rows []example, results []pipeline.StageResult, spec decoder.InitialAdapterSpec) {
 	t.Helper()
 	ctx := context.Background()
 	steps := int(c.Protocol.TargetStep)
-	losses, adapter, moments := freshTrajectory(t, c, rows, spec, steps)
+	losses, adapter, moments := freshTrajectoryWith(t, cpu, c, rows, spec, steps)
 	root, e := stageRoot(stage.ArtifactDirectory)
 	if e != nil {
 		t.Fatal(e)
@@ -304,5 +310,14 @@ func TestNativeSFTStageCarriesTheApplicationsTargetDigest(t *testing.T) {
 	stage.Execution.TargetSHA256 = "not-a-digest"
 	if _, e := h.identity(context.Background(), stage); e == nil {
 		t.Fatal("a malformed target digest was admitted")
+	}
+}
+
+// rotary sets or clears the tables of every full-attention layer.
+func rotary(model *decoder.LoadedTextModel, cosine, sine *torch.Tensor) {
+	for layer := range model.Model.Layers {
+		if model.Model.Layers[layer].Weights.Full != nil {
+			model.Model.Layers[layer].Cosine, model.Model.Layers[layer].Sine = cosine, sine
+		}
 	}
 }

@@ -107,6 +107,11 @@ func (r Recipe) validate() error {
 			return errors.New("local training: recipe identity missing")
 		}
 	}
+	// A declared coverage is part of the recipe's identity; an absent one is
+	// the q/v coverage every earlier recipe trained.
+	if err := r.Assembly.AdapterCoverage.Validate(); err != nil {
+		return errors.Join(errRecipe, err)
+	}
 	return optim.ValidateAdamWConfig(r.Optimizer)
 }
 
