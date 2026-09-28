@@ -528,7 +528,12 @@ func TestTheEndOfTurnMustBeOneTokenAndEveryIDInTheVocabulary(t *testing.T) {
 // TRAJECTORY_ORNITH_TOKENIZER_JSON names a copy, and Load refuses any other.
 const ornithTokenizerSHA256 = "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
 
-func TestTheOrnithTokenizerWritesTheRowOptIn(t *testing.T) {
+// ornithTokenizer loads the copy TRAJECTORY_ORNITH_TOKENIZER_JSON names and
+// holds its ids for the template's pieces to ornithSpecials. The test is
+// skipped when the variable is unset.
+func ornithTokenizer(t *testing.T) *tokenizer.Tokenizer {
+	t.Helper()
+
 	path := os.Getenv("TRAJECTORY_ORNITH_TOKENIZER_JSON")
 	if path == "" {
 		t.Skip("set TRAJECTORY_ORNITH_TOKENIZER_JSON to the Ornith-1.5-9B tokenizer.json, sha256 " + ornithTokenizerSHA256)
@@ -548,6 +553,12 @@ func TestTheOrnithTokenizerWritesTheRowOptIn(t *testing.T) {
 			t.Fatalf("the Ornith tokenizes %q as %v (%v), want [%d]", piece, ids, err, want)
 		}
 	}
+	return loaded
+}
+
+func TestTheOrnithTokenizerWritesTheRowOptIn(t *testing.T) {
+	loaded := ornithTokenizer(t)
+	ctx := context.Background()
 
 	newline, err := loaded.Encode(ctx, "\n")
 	if err != nil || len(newline) != 1 {
