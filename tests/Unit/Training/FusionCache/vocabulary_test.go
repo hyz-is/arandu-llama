@@ -40,7 +40,10 @@ func measured() (teacher, student tokenizer.Vocabulary) {
 
 // vocabularyFixture is the cache fixture with a teacher whose tokenizer file
 // differs from the student's and whose vocabulary was measured to agree on
-// the six ids the student declares.
+// the six ids the student's tokenizer declares. Both models have output rows
+// past those ids, the student seven and the teacher eight, as Ornith's
+// 248320 rows lie past the 248070 ids of its tokenizer.json, so only the
+// common range bounds a token there.
 func vocabularyFixture(t *testing.T) (fusioncache.Cache, fusioncache.Expectation) {
 	t.Helper()
 	teacher, student := measured()
@@ -50,7 +53,7 @@ func vocabularyFixture(t *testing.T) (fusioncache.Cache, fusioncache.Expectation
 	}
 	c, e := fixture(t)
 	e.Teacher.TokenizerSHA256, e.Student.TokenizerSHA256 = teacher.SourceSHA256, student.SourceSHA256
-	e.Student.Vocabulary = 6
+	e.Student.Vocabulary = 7
 	e.Mapping = mapping
 	e.MappingSHA256 = digest(t, mapping)
 	c.Teacher, c.Student, c.Mapping, c.MappingSHA256 = e.Teacher, e.Student, e.Mapping, e.MappingSHA256
@@ -87,8 +90,8 @@ func TestAMeasuredVocabularyAdmitsDifferentTokenizerFiles(t *testing.T) {
 
 func TestAMeasuredVocabularyRefusesMassOutsideItsCommonRange(t *testing.T) {
 	c, e := vocabularyFixture(t)
-	// Id 6 is a [PAD…] token of the teacher, inside its vocabulary and outside
-	// the range the two tokenizers were measured on.
+	// Id 6 is a [PAD…] token of the teacher, inside both models' output rows
+	// and outside the range the two tokenizers were measured on.
 	outside := clone(t, c)
 	p := &outside.Records[0].Positions[0]
 	p.Probabilities = append(p.Probabilities, fusioncache.Probability{TeacherTokenID: 6, StudentTokenID: 6, Probability: 0.125})
@@ -145,7 +148,7 @@ func TestAMeasuredVocabularyIsRefusedWhereItCannotHold(t *testing.T) {
 		"bijection":      func(e *fusioncache.Expectation) { e.Mapping.Identity = false },
 		"algorithm":      func(e *fusioncache.Expectation) { e.Mapping.Vocabulary.Algorithm = "tayi-vocabulary-v0" },
 		"digest":         func(e *fusioncache.Expectation) { e.Mapping.Vocabulary.SHA256 = "not-a-digest" },
-		"student range":  func(e *fusioncache.Expectation) { e.Mapping.Vocabulary.CommonTokens = 7 },
+		"student range":  func(e *fusioncache.Expectation) { e.Mapping.Vocabulary.CommonTokens = 8 },
 		"teacher range":  func(e *fusioncache.Expectation) { e.Teacher.Vocabulary = 5 },
 		"single token":   func(e *fusioncache.Expectation) { e.Mapping.Vocabulary.CommonTokens = 1 },
 		"tokenizer file": func(e *fusioncache.Expectation) { e.Teacher.TokenizerSHA256 = strings.Repeat("6", 64) },

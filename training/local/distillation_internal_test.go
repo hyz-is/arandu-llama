@@ -244,8 +244,13 @@ func TestLoadDistillationKeepsEachTeachersMappedTopKForEveryRow(t *testing.T) {
 			}
 		}
 	}
-	if _, err := signals.teachersFor(1, kdRows[0]); !errors.Is(err, ErrDistillation) {
+	// Rows first and third both have one completion token, so only the id
+	// tells their signals apart.
+	if _, err := signals.teachersFor(2, kdRows[0]); !errors.Is(err, ErrDistillation) {
 		t.Fatal("another row's signals were handed out", err)
+	}
+	if _, err := signals.teachersFor(len(kdRows), kdRows[0]); !errors.Is(err, ErrDistillation) {
+		t.Fatal("signals past the curriculum were handed out", err)
 	}
 	short := kdRows[1]
 	short.InputIDs = short.InputIDs[:2]
