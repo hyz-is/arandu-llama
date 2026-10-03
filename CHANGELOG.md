@@ -10,6 +10,8 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-03
+
 ### Added
 
 - `RenderChatTemplate` renders a conversation with a Jinja chat template without

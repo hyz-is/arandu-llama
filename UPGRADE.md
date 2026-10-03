@@ -1,6 +1,6 @@
 # Upgrade Guide
 
-## Unreleased
+## v0.7.0
 
 Chat prompts change for templates the legacy formatter read as a known format:
 they are now the model's own Jinja template, which may add a reasoning system
