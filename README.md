@@ -185,10 +185,13 @@ submodule is needed to *build the archives*, not to consume the module.
 
 ## Model-first data path
 
-`Llama` embeds `model.Model[Llama]`, and `Llamas(db)` is the one configured
-copy every read and write goes through. There is no Repository beside it: a
-type wrapping the Model becomes a second data path, and a second data path is
-one the policy does not guard.
+`Llama` embeds `model.Model`, its table is declared once beside it in
+`model.go`, and `Llamas(db)` is the one entry point every read and write goes
+through. The query it returns, `LlamaQuery`, is generated in `LlamaQuery.go` by
+`aru model:build` and is never edited by hand; `aru model:build --check` fails
+when the committed file is not the one the entity produces. There is no
+Repository beside it: a type wrapping the Model becomes a second data path, and
+a second data path is one the policy does not guard.
 
 A service method follows `validate -> security.Authorize -> Grant -> Model
 terminal`, in that order and no other. Handlers stay thin — they read the

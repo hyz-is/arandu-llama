@@ -38,10 +38,34 @@ gigabytes of weights.
 
 ## The data path is the configured Model
 
-`func Llamas(db *data.DB) *model.Model[Llama]` returns the one configured copy,
-and every read and write in the package goes through it. The primary key is
-application-generated text, so `KeyType` is `"string"` and `Incrementing` is
-false -- a DEFAULT that produces a uuid is spelled differently in every engine.
+`Llama` embeds `model.Model`, and its table is declared once beside it in
+`model.go`:
+
+```go
+var llamaTable = model.NewTable(model.TableSpec{
+	Name:      "llamas",
+	New:       func() model.Entity { return new(Llama) },
+	ManualKey: true,
+})
+```
+
+The primary key is application-generated text, so the table says `ManualKey`
+-- a DEFAULT that produces a uuid is spelled differently in every engine. Do not
+set `Global`: it is the only setting that drops the tenant filter, and this
+package owns tenant data.
+
+`func Llamas(db model.DB) *LlamaQuery` is the one entry point for that table,
+and every read and write in the package goes through it. It is generated, with
+`LlamaQuery` and `LlamaCollection`, into `LlamaQuery.go` by `aru model:build`;
+never edit that file. After changing the entity or its table, run
+`aru model:build` and commit the regenerated file with the change, and
+`aru model:build --check` exits non-zero while it is stale.
+
+Keep rows as pointers after `New`, `First`, `Find`, or `Get`. A copy of the row
+still reads its fields, but every write promoted from its embedded Model refuses
+with `model.ErrUnwired`: the copy is not the row the table built. Never assign
+over a row that `New` returned (`*row = other`): that replaces its embedded
+Model with the other value's, and the row can no longer save.
 
 Never add a Repository beside it. A type wrapping the Model becomes a second
 data path, and a second data path is one the policy does not guard.
