@@ -57,6 +57,217 @@ parameters and local recipes must be supplied explicitly. Checkpoint inspection
 and resumption retain artifact checks. A configuration's admission is not proof
 that a new architecture or training recipe has been scientifically qualified.
 
+### The llama is a concrete type over the non-generic model
+
+Hesape `v0.47.0` removes the generic model layer, and this release moves to it
+with Hesape `v0.48.0` and Framework `v0.50.2`. `Llama` embeds the non-generic
+`model.Model`, its table is declared once beside it with `model.NewTable`, and
+the query that starts from it is generated beside it by `aru model:build`, in
+`LlamaQuery.go`. No route, migration, action, policy decision or tenant rule
+changed.
+
+**`Llamas` returns the generated query.** It takes a `model.DB` -- a `*data.DB`
+passes unchanged -- and returns `*llama.LlamaQuery` instead of
+`*model.Model[llama.Llama]`. A chain that started from it keeps its text, minus
+the calls that no longer exist:
+
+| before | now |
+|---|---|
+| `llama.Llamas(db).NewQuery().Where(…)` | `llama.Llamas(db).Where(…)` |
+| `llama.Llamas(db).NewInstance(nil, false)` and `.Entity` | `llama.Llamas(db).New()`, which returns `*Llama` |
+| `Get` → `model.Collection[llama.Llama]` | `Get` → `llama.LlamaCollection` (`[]*Llama`) |
+| `func(q *model.Builder[llama.Llama])` in a grouped `Where` | `func(q *llama.LlamaQuery)` |
+| `llama.Llamas(db).GetTable()`, `.KeyType`, `.TenantColumn` | nothing: the table is unexported, and its settings are not read off the query |
+
+`First`, `Find` and the other row terminals still return `*Llama`, and still
+take the Grant. Every `LlamaService` method keeps its signature: `Create` and
+`Find` still return `*Llama`, and `List` still returns `[]*Llama`.
+
+**The entity no longer carries the model's configuration.** `Llama` embeds
+`model.Model`, so the fields and methods `model.Model[Llama]` promoted onto it
+are gone: the configuration fields (`PrimaryKey`, `KeyType`, `Incrementing`,
+`Timestamps`, `TenantColumn`, `Table` and the rest) live in the table, which this
+package keeps unexported, and `Exists` and `WasRecentlyCreated` are methods,
+`row.Exists()`. A copied row still reads its fields but refuses every write with
+`model.ErrUnwired`, so keep the pointers the queries return.
+
+**Upgrade the floor.** The module requires Hesape `v0.48.0` and Framework
+`v0.50.2`, and `arandu.mod.toml` declares `framework = ">= 0.50"`. An
+application that pins a Hesape below `v0.47.0` cannot compile this release:
+every generic model type it would need is gone from Hesape itself. The
+published views are unchanged and need no republish.
+
+**What changes without a compiler error.** The store route, `POST` on the
+prefix, reads `name`, `subject`, `policy`, `quantisation`, `loss`, `tokens` and
+`milliseconds` through `Context.Input`, and since Hesape `v0.44.0` the input of
+a `POST` is its body alone: a url-encoded or multipart form, or a JSON object. A
+field sent only in the query string of the `POST` is no longer read. The listing
+and the record routes are `GET` and read the query string as before.
+
+<details>
+<summary>Every incompatible symbol <code>apidiff</code> reports for the model change</summary>
+
+Most of these are the methods and fields `model.Model[Llama]` promoted onto
+`Llama`, which left with the generic type.
+
+```text
+Llama.ConnectionName
+Llama.CreatedAtColumn
+Llama.DeletedAtColumn
+Llama.Entity
+Llama.Exists
+Llama.Grammar
+Llama.Incrementing
+Llama.KeyType
+Llama.NamedScopes
+Llama.PerPage
+Llama.PrimaryKey
+Llama.Processor
+Llama.RelationResolvers
+Llama.SoftDeletes
+Llama.Table
+Llama.TenantColumn
+Llama.Timestamps
+Llama.UpdatedAtColumn
+Llama.WasRecentlyCreated
+Llamas
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).AddGlobalScope, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).All, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Append, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).AttributesToArray, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).CallNamedScope, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Create, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Destroy, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).DiscardChanges, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Except, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Find, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).FindMany, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).FindOrFail, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).FindOrNew, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).First, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).FirstOrCreate, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).FirstOrNew, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ForceCreate, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ForceDeleteQuietly, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ForceDeleted, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ForceDeleting, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ForceDestroy, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).FreshTimestamp, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetAppends, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetConnectionName, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetCreatedAtColumn, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetDeletedAtColumn, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetForeignKey, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetGlobalScopes, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetHidden, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetIncrementing, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetKeyName, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetKeyType, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetMorphClass, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetPerPage, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetPrevious, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetQualifiedCreatedAtColumn, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetQualifiedDeletedAtColumn, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetQualifiedKeyName, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetQualifiedUpdatedAtColumn, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetQueueableConnection, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetQueueableID, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetQueueableRelations, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetRawOriginal, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetRelation, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetRelations, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetRouteKey, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetRouteKeyName, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetTable, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetTouchedRelations, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetUpdatedAtColumn, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).GetVisible, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).HasAppended, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).HasGlobalScope, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).HasNamedScope, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Is
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).IsForceDeleting, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).IsIgnoringTouch, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).IsNot, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).IsRelation, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).IsSoftDeletable, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).LoadAggregate, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).LoadMorph, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).LoadMorphAggregate, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).LoadMorphAvg, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).LoadMorphCount, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).LoadMorphMax, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).LoadMorphMin, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).LoadMorphSum, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).MakeHidden
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).MakeVisible
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewBaseQueryBuilder, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewCollection, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewFromBuilder, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewInstance, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewModelQuery, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewQuery, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewQueryForRestoration, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewQueryWithoutRelationships, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewQueryWithoutScope, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewQueryWithoutScopes, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).NewTypedBuilder, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).On, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).OnWriteConnection, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Only, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).OnlyTrashed, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).OriginalIsEquivalent, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).PushQuietly, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).QualifyColumn, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).QualifyColumns, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Query, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Ref, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).RegisterGlobalScopes, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).RegisterModelEvent, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ReplicateQuietly, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ResolveRouteBinding, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ResolveRouteBindingQuery, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ResolveSoftDeletableRouteBinding, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).RestoreQuietly, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Restored, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Restoring, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetAppends, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetConnection, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetHidden, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetIncrementing, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetKeyName, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetKeyType, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetPerPage, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetRelation
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetRelations, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetTable, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetTouchedRelations, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SetVisible, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SoftDeleted, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SyncChanges, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SyncOriginal
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SyncOriginalAttribute, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).SyncOriginalAttributes, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).ToPrettyJSON, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Touches, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).UnsetAttribute, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).UnsetRelation, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).UnsetRelations, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).UpdateOrCreate, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).UpdateOrFail, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).UpdateQuietly, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).UpdateTimestamps, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).UsesTimestamps, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).Where, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).WhereKey, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).With, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).WithTrashed, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).WithoutRelations, method set of *Llama
+github.com/arandu-io/hesape/database/model.(*Model[github.com/tayi-ai/arandu-llama.Llama]).WithoutTimestamps, method set of *Llama
+```
+
+</details>
+
 ## v0.5.0
 
 This historical release retained its Q4 MX default. Q2 callers selected an

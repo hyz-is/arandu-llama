@@ -176,6 +176,16 @@ a release is corrected by another release and never by moving a tag.
   longer selects a production model or publishes operational model pins.
 - Operational identifiers have been removed from this document's current text;
   previously published versions remain historical releases.
+- **Breaking.** `Llama` embeds the non-generic `model.Model`, and its table is
+  declared once beside it with `model.NewTable`. `Llamas` takes a `model.DB`
+  and returns the generated `*LlamaQuery`; `Get` returns `LlamaCollection` and
+  `New` replaces `NewInstance(nil, false)`. The fields and methods
+  `model.Model[Llama]` promoted onto `Llama` are gone, and `Exists` is a
+  method. `UPGRADE.md` names every symbol.
+- Requires Hesape `v0.48.0` and Framework `v0.50.2`; `arandu.mod.toml` declares
+  `framework = ">= 0.50"`. The store route reads its fields from the body of
+  the `POST` only, as Hesape now reads every `POST`. Routes, migrations,
+  actions, policy decisions and tenant scoping are unchanged.
 
 ## [0.5.0] - 2026-09-15
 
