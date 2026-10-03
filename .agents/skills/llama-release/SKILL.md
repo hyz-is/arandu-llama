@@ -96,7 +96,7 @@ The framework floor is checked against `go.mod` by a test, so the two cannot
 drift. It reads:
 
 ```toml
-framework = ">= 0.46"
+framework = ">= 0.50"
 ```
 
 It moves only when something in the code needs the newer version, and it moves

@@ -8,6 +8,7 @@
 //	module.go      -> registration, routes, handlers and migrations
 //	config.go      -> what the application passes in
 //	model.go       -> the entity, and what it may answer with
+//	LlamaQuery.go  -> the generated query of the entity, never edited
 //	policy.go      -> who may do what
 //	service.go     -> the rules and Model access, after authorization
 //	views.go       -> the files the application takes ownership of

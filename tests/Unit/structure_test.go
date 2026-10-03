@@ -95,8 +95,11 @@ func TestThePackageUsesTheModelFirstDataPath(t *testing.T) {
 	wants := map[string][]string{
 		"model.go": {
 			`"github.com/arandu-io/hesape/database/model"`,
-			"model.Model[Llama]",
-			"func Llamas(db *data.DB) *model.Model[Llama]",
+			"type Llama struct {\n\tmodel.Model\n",
+			"var llamaTable = model.NewTable(model.TableSpec{",
+		},
+		"LlamaQuery.go": {
+			"func Llamas(db model.DB) *LlamaQuery",
 		},
 		"service.go": {
 			"db     *data.DB",

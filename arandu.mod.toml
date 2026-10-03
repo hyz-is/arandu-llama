@@ -6,7 +6,7 @@
 # four lines below worth reading before installing anything.
 
 name = "tayi-ai/llama"
-framework = ">= 0.46"
+framework = ">= 0.50"
 profiles = ["conventional", "performance"]
 
 [permissions]
